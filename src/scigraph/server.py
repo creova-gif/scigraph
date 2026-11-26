@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
+import uuid
 from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +32,16 @@ from solver.symbolic import detect_contradictions, propose_falsifiable_experimen
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 _API_VERSION = "0.1.0"
 _SQLITE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _sanitize_request_id(raw: str | None) -> str:
+    """Return stripped raw request ID if valid, otherwise generate a fresh UUID hex."""
+    if raw is not None:
+        stripped = raw.strip()
+        if _REQUEST_ID_PATTERN.fullmatch(stripped):
+            return stripped
+    return uuid.uuid4().hex
 
 
 class ServerResponse(BaseModel):
@@ -512,6 +524,14 @@ class SciGraphApp:
         return _json_response(HTTPStatus.OK, {"reports": reports})
 
 
+class _SciGraphHTTPServer(ThreadingHTTPServer):
+    """Hardened ThreadingHTTPServer with bounded queue, daemon threads, and address reuse."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 64
+
+
 def create_http_server(
     host: str,
     port: int,
@@ -520,11 +540,19 @@ def create_http_server(
     """Create a ThreadingHTTPServer wired to a SciGraphApp instance."""
 
     class _Handler(BaseHTTPRequestHandler):
+        _current_request_id: str = ""
+
+        def setup(self) -> None:
+            self.request.settimeout(30.0)
+            self._current_request_id = ""
+            super().setup()
+
         def log_message(self, format: str, *args: object) -> None:
             # Suppress default stderr request logging for clean CLI/test output.
             return
 
         def do_GET(self) -> None:
+            self._current_request_id = _sanitize_request_id(self.headers.get("X-Request-Id"))
             hdr_value = self.headers.get("Authorization")
             status, content_type, body_text = app.handle_request(
                 "GET",
@@ -535,6 +563,7 @@ def create_http_server(
             self._write_response(status, content_type, body_text)
 
         def do_POST(self) -> None:
+            self._current_request_id = _sanitize_request_id(self.headers.get("X-Request-Id"))
             raw_len = self.headers.get("Content-Length", "0")
             try:
                 content_length = int(raw_len)
@@ -587,10 +616,11 @@ def create_http_server(
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Request-Id", self._current_request_id)
             self.end_headers()
             self.wfile.write(payload)
 
-    return ThreadingHTTPServer((host, port), _Handler)
+    return _SciGraphHTTPServer((host, port), _Handler)
 
 
 def _load_graph_from_store(store_path: Path) -> ClaimGraph:

@@ -302,3 +302,80 @@ def test_claim_graph_from_dict_rejects_orphan_claims_and_dangling_edges() -> Non
     dangling_target_payload["edges"][0]["target_claim_id"] = "claim-missing-tgt"
     with pytest.raises(ValueError, match="unknown target_claim_id 'claim-missing-tgt'"):
         ClaimGraph.from_dict(dangling_target_payload)
+
+
+def test_sqlite_store_wal_and_busy_timeout(tmp_path: Path) -> None:
+    db_path = tmp_path / "wal.sqlite3"
+    store = GraphSQLiteStore(db_path)
+
+    with store._connection() as conn:
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()
+        busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()
+        synchronous = conn.execute("PRAGMA synchronous").fetchone()
+
+    assert journal_mode == ("wal",)
+    assert busy_timeout == (5000,)
+    assert synchronous == (1,)
+
+
+def test_sqlite_store_query_claims_parity_with_claim_graph(tmp_path: Path) -> None:
+    graph = _build_sample_graph()
+    store = GraphSQLiteStore(tmp_path / "parity.sqlite3")
+    store.save_graph(graph)
+
+    filter_cases: list[dict[str, object]] = [
+        {},
+        {"intervention": "metform"},
+        {"condition": "diabetes"},
+        {"outcome": "GLUCOSE"},
+        {"effect_direction": EffectDirection.NO_EFFECT},
+        {"paper_id": "paper-002"},
+        {"paper_id": "paper-00"},
+        {
+            "intervention": "METFORMIN",
+            "condition": "normoglycemic",
+            "outcome": "gluconeogenesis",
+            "effect_direction": EffectDirection.DECREASES,
+            "paper_id": "paper-003",
+        },
+        {"intervention": "nonexistent"},
+    ]
+
+    for kwargs in filter_cases:
+        expected = graph.query_claims(**kwargs)  # type: ignore[arg-type]
+        actual = store.query_claims(**kwargs)  # type: ignore[arg-type]
+        assert actual == expected
+
+
+def test_sqlite_store_query_claims_escapes_like_wildcards(tmp_path: Path) -> None:
+    graph = ClaimGraph()
+    p1, c1 = _make_paper_and_claim(
+        paper_id="paper-101",
+        doi="10.1038/scigraph.2025.101",
+        claim_id="claim-101",
+        intervention="100% Pure Metformin",
+        condition="Adults",
+        outcome="Glucose_Level\\Fast",
+        direction=EffectDirection.DECREASES,
+    )
+    p2, c2 = _make_paper_and_claim(
+        paper_id="paper-102",
+        doi="10.1038/scigraph.2025.102",
+        claim_id="claim-102",
+        intervention="1000 Pure Metformin",
+        condition="Adults",
+        outcome="GlucoseXLevelFast",
+        direction=EffectDirection.DECREASES,
+    )
+    graph.add_verified_claim(p1, c1)
+    graph.add_verified_claim(p2, c2)
+
+    store = GraphSQLiteStore(tmp_path / "wildcards.sqlite3")
+    store.save_graph(graph)
+
+    assert [c.claim_id for c in store.query_claims(intervention="100%")] == ["claim-101"]
+    assert [c.claim_id for c in store.query_claims(outcome="glucose_level\\fast")] == [
+        "claim-101"
+    ]
+    assert store.query_claims(intervention="%") == (c1,)
+    assert store.query_claims(outcome="_") == (c1,)

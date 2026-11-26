@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from graph.claim_graph import ClaimGraph
+from scigraph.models import EffectDirection, ScientificClaim
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS papers (
@@ -71,6 +72,12 @@ def load_graph_json(path: Path) -> ClaimGraph:
     return ClaimGraph.from_dict(raw)
 
 
+def _escape_like_pattern(value: str) -> str:
+    """Escape SQLite LIKE wildcards ('%', '_', '\\') for substring matching."""
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped.lower()}%"
+
+
 class GraphSQLiteStore:
     """Zero-dependency SQLite persistence store for ClaimGraph."""
 
@@ -82,8 +89,11 @@ class GraphSQLiteStore:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self._db_path)
+        conn = sqlite3.connect(self._db_path, timeout=5.0)
         try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             with conn:
                 yield conn
         finally:
@@ -155,3 +165,47 @@ class GraphSQLiteStore:
                 "edges": edges,
             }
         )
+
+    def query_claims(
+        self,
+        *,
+        intervention: str | None = None,
+        condition: str | None = None,
+        outcome: str | None = None,
+        effect_direction: EffectDirection | None = None,
+        paper_id: str | None = None,
+    ) -> tuple[ScientificClaim, ...]:
+        """Query persisted claims using SQL WHERE pushdown and in-memory filtering."""
+        clauses: list[str] = []
+        params: list[str] = []
+
+        if paper_id is not None:
+            clauses.append("paper_id = ?")
+            params.append(paper_id)
+        if intervention is not None:
+            clauses.append("LOWER(intervention) LIKE ? ESCAPE '\\'")
+            params.append(_escape_like_pattern(intervention))
+        if outcome is not None:
+            clauses.append("LOWER(outcome) LIKE ? ESCAPE '\\'")
+            params.append(_escape_like_pattern(outcome))
+
+        sql = "SELECT payload_json FROM claims"
+        if clauses:
+            sql = f"{sql} WHERE {' AND '.join(clauses)}"
+        sql = f"{sql} ORDER BY rowid ASC"
+
+        with self._connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        needle_c = condition.casefold() if condition is not None else None
+        matched: list[ScientificClaim] = []
+        for (payload_json,) in rows:
+            claim = ScientificClaim.model_validate_json(payload_json)
+            ct = claim.claim_tuple
+            if needle_c is not None and needle_c not in ct.condition.casefold():
+                continue
+            if effect_direction is not None and ct.direction != effect_direction:
+                continue
+            matched.append(claim)
+
+        return tuple(matched)

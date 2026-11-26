@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -11,7 +13,13 @@ from typing import Any
 from graph.claim_graph import ClaimGraph
 from ingest.extractor import extract_claims_from_paper
 from scigraph.models import Paper
-from scigraph.server import MAX_REQUEST_BYTES, SciGraphApp, create_http_server
+from scigraph.server import (
+    MAX_REQUEST_BYTES,
+    SciGraphApp,
+    _sanitize_request_id,
+    _SciGraphHTTPServer,
+    create_http_server,
+)
 
 
 def _make_paper(
@@ -283,3 +291,82 @@ def test_http_server_end_to_end() -> None:
         assert status == 404
         assert headers["x-content-type-options"] == "nosniff"
         assert "error" in json.loads(body)
+
+
+def test_http_server_hardening_attributes_and_socket_timeout() -> None:
+    app = SciGraphApp(_build_populated_graph())
+    server = create_http_server("127.0.0.1", 0, app)
+    try:
+        assert isinstance(server, _SciGraphHTTPServer)
+        assert server.daemon_threads is True
+        assert server.allow_reuse_address is True
+        assert server.request_queue_size == 64
+
+        client_sock, server_sock = socket.socketpair()
+        try:
+            client_sock.sendall(
+                b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            client_sock.shutdown(socket.SHUT_WR)
+            server.RequestHandlerClass(server_sock, ("127.0.0.1", 12345), server)
+            assert server_sock.gettimeout() == 30.0
+            response = client_sock.recv(4096)
+            assert b"200 OK" in response
+            assert b"X-Request-Id:" in response
+        finally:
+            client_sock.close()
+            server_sock.close()
+    finally:
+        server.server_close()
+
+
+def test_sanitize_request_id_and_http_correlation_header() -> None:
+    hex_uuid_re = re.compile(r"^[0-9a-f]{32}$")
+
+    # Valid IDs (including surrounding whitespace) are preserved.
+    assert _sanitize_request_id("req-123.abc_XYZ") == "req-123.abc_XYZ"
+    assert _sanitize_request_id("  valid_id-01  ") == "valid_id-01"
+
+    # Missing, empty, oversized, or newline-containing IDs are regenerated.
+    for invalid in (None, "", "   ", "bad\nid", "bad\r\nid", "bad id", "x" * 65, "bad/id"):
+        regenerated = _sanitize_request_id(invalid)
+        assert hex_uuid_re.fullmatch(regenerated) is not None
+        assert regenerated != invalid
+
+    app = SciGraphApp(_build_populated_graph())
+    with _running_server(app) as base_url:
+        # Echo valid X-Request-Id on GET
+        status, headers, _ = _http_request(
+            f"{base_url}/health",
+            headers={"X-Request-Id": "trace-abc_123.v1"},
+        )
+        assert status == 200
+        assert headers["x-request-id"] == "trace-abc_123.v1"
+
+        # Regenerate when X-Request-Id is omitted
+        status, headers, _ = _http_request(f"{base_url}/health")
+        assert status == 200
+        assert hex_uuid_re.fullmatch(headers["x-request-id"]) is not None
+
+        # Regenerate when X-Request-Id is invalid (e.g. disallowed chars / too long)
+        bad_id = "invalid/id with spaces"
+        status, headers, _ = _http_request(
+            f"{base_url}/health",
+            headers={"X-Request-Id": bad_id},
+        )
+        assert status == 200
+        assert headers["x-request-id"] != bad_id
+        assert hex_uuid_re.fullmatch(headers["x-request-id"]) is not None
+
+        # Echo valid X-Request-Id on POST (including error responses)
+        status, headers, _ = _http_request(
+            f"{base_url}/api/v1/verify",
+            method="POST",
+            data=b"{bad",
+            headers={
+                "Content-Type": "application/json",
+                "X-Request-Id": "post-req-99",
+            },
+        )
+        assert status == 400
+        assert headers["x-request-id"] == "post-req-99"
