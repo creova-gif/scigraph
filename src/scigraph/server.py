@@ -64,18 +64,31 @@ class ServerResponse(BaseModel):
     status: int
     content_type: str
     body: str
+    allow: str | None = None
+    content_length: int | None = None
 
 
-def _json_response(status: int, payload: object) -> ServerResponse:
+def _json_response(
+    status: int,
+    payload: object,
+    *,
+    allow: str | None = None,
+) -> ServerResponse:
     return ServerResponse(
         status=status,
         content_type="application/json",
         body=json.dumps(payload, indent=2) + "\n",
+        allow=allow,
     )
 
 
-def _error_response(status: int, message: str) -> ServerResponse:
-    return _json_response(status, {"error": message})
+def _error_response(
+    status: int,
+    message: str,
+    *,
+    allow: str | None = None,
+) -> ServerResponse:
+    return _json_response(status, {"error": message}, allow=allow)
 
 
 def load_token_policies(path: Path) -> tuple[TokenPolicy, ...]:
@@ -462,12 +475,20 @@ class SciGraphApp:
             return self._require_get(method, lambda: self._handle_explorer())
         if path == "/health":
             if method == "HEAD":
+                health_resp = self._handle_health()
                 return ServerResponse(
-                    status=HTTPStatus.OK,
-                    content_type="application/json",
+                    status=health_resp.status,
+                    content_type=health_resp.content_type,
                     body="",
+                    content_length=len(health_resp.body.encode("utf-8")),
                 )
-            return self._require_get(method, lambda: self._handle_health())
+            if method == "GET":
+                return self._handle_health()
+            return _error_response(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                f"Method {method} not allowed",
+                allow="GET, HEAD",
+            )
         if path == "/metrics":
             return self._require_get(method, lambda: self._handle_metrics())
         if path == "/openapi.json":
@@ -489,6 +510,7 @@ class SciGraphApp:
                 return _error_response(
                     HTTPStatus.METHOD_NOT_ALLOWED,
                     f"Method {method} not allowed",
+                    allow="POST",
                 )
             return self._handle_verify(body, params)
 
@@ -497,7 +519,11 @@ class SciGraphApp:
     @staticmethod
     def _require_get(method: str, handler: Callable[[], ServerResponse]) -> ServerResponse:
         if method != "GET":
-            return _error_response(HTTPStatus.METHOD_NOT_ALLOWED, f"Method {method} not allowed")
+            return _error_response(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                f"Method {method} not allowed",
+                allow="GET",
+            )
         return handler()
 
     def _handle_explorer(self) -> ServerResponse:
@@ -844,13 +870,21 @@ def create_http_server(
         def _handle_no_body_method(self, method: str, *, include_body: bool) -> None:
             self._current_request_id = _sanitize_request_id(self.headers.get("X-Request-Id"))
             hdr_value = self.headers.get("Authorization")
-            status, content_type, body_text = app.handle_request(
+            resp = app._dispatch(
                 method,
                 self.path,
-                incoming_header=hdr_value,
-                remote_addr=self.client_address[0],
+                b"",
+                hdr_value,
+                self.client_address[0],
             )
-            self._write_response(status, content_type, body_text, include_body=include_body)
+            self._write_response(
+                resp.status,
+                resp.content_type,
+                resp.body,
+                include_body=include_body,
+                allow=resp.allow,
+                content_length=resp.content_length,
+            )
 
         def do_GET(self) -> None:
             self._handle_no_body_method("GET", include_body=True)
@@ -881,6 +915,8 @@ def create_http_server(
                     guard_resp.status,
                     guard_resp.content_type,
                     guard_resp.body,
+                    allow=guard_resp.allow,
+                    content_length=guard_resp.content_length,
                 )
                 return
 
@@ -935,7 +971,13 @@ def create_http_server(
                 remote_addr,
                 skip_pre_body_guards=True,
             )
-            self._write_response(resp.status, resp.content_type, resp.body)
+            self._write_response(
+                resp.status,
+                resp.content_type,
+                resp.body,
+                allow=resp.allow,
+                content_length=resp.content_length,
+            )
 
         def _write_response(
             self,
@@ -944,11 +986,16 @@ def create_http_server(
             body_text: str,
             *,
             include_body: bool = True,
+            allow: str | None = None,
+            content_length: int | None = None,
         ) -> None:
             payload = body_text.encode("utf-8")
+            wire_length = len(payload) if content_length is None else content_length
             self.send_response(status)
             self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Length", str(wire_length))
+            if allow is not None:
+                self.send_header("Allow", allow)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Request-Id", self._current_request_id)

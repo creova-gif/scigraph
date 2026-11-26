@@ -618,3 +618,22 @@ def test_export_workspace_bundle_with_hmac_key(tmp_path: Path) -> None:
     export_events = manager.read_audit_log("org-hmac", "ws-hmac", action="export")
     assert len(export_events) == 1
     assert export_events[0].status == "ok"
+
+
+def test_export_workspace_bundle_rejects_workspace_or_subdir_output_dir(tmp_path: Path) -> None:
+    manager = WorkspaceManager(tmp_path / "workspaces")
+    manager.init_workspace("org-safe", "ws-safe", "Safe Export")
+    ws_dir = tmp_path / "workspaces" / "org-safe" / "ws-safe"
+
+    with pytest.raises(
+        ValueError,
+        match="Export output_dir must not be inside the source workspace directory",
+    ):
+        manager.export_workspace_bundle("org-safe", "ws-safe", ws_dir)
+
+    with pytest.raises(
+        ValueError,
+        match="Export output_dir must not be inside the source workspace directory",
+    ):
+        manager.export_workspace_bundle("org-safe", "ws-safe", ws_dir / "nested" / "bundle")
+

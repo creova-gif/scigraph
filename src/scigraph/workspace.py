@@ -330,6 +330,10 @@ class WorkspaceManager:
 
         self.get_workspace(org_id, workspace_id)
         ws_dir = self._resolve_workspace_dir(org_id, workspace_id)
+        resolved_out = output_dir.resolve()
+        resolved_ws = ws_dir.resolve()
+        if resolved_out.is_relative_to(resolved_ws):
+            raise ValueError("Export output_dir must not be inside the source workspace directory")
 
         with _workspace_lock(ws_dir):
             config = self.get_workspace(org_id, workspace_id)

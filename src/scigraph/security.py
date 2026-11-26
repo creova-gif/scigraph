@@ -183,8 +183,12 @@ class SlidingWindowRateLimiter:
                 if len(self._windows) >= self._max_clients:
                     self._prune_windows_locked(cutoff)
                     if len(self._windows) >= self._max_clients:
-                        min_oldest = min(win[0] for win in self._windows.values())
-                        retry_after = max(0.0, (min_oldest + self._window_seconds) - now)
+                        earliest_evict_ts = min(
+                            win[-1] for win in self._windows.values() if win
+                        )
+                        retry_after = max(
+                            0.0, (earliest_evict_ts + self._window_seconds) - now
+                        )
                         return (False, retry_after)
                 bucket = deque()
                 self._windows[client_key] = bucket

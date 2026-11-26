@@ -654,15 +654,30 @@ def test_app_head_health_and_method_not_allowed() -> None:
     assert ctype == "application/json"
     assert body == ""
 
+    head_resp = app._dispatch("HEAD", "/health", b"", None, "local")
+    _, _, get_body = app.handle_request("GET", "/health")
+    assert head_resp.content_length == len(get_body.encode("utf-8"))
+
     claims_status, claims_ctype, claims_body = app.handle_request("HEAD", "/api/v1/claims")
     assert claims_status == 405
     assert claims_ctype == "application/json"
     assert json.loads(claims_body)["error"] == "Method HEAD not allowed"
 
+    health_post_resp = app._dispatch("POST", "/health", b"", None, "local")
+    assert health_post_resp.status == 405
+    assert health_post_resp.allow == "GET, HEAD"
+
+    verify_get_resp = app._dispatch("GET", "/api/v1/verify", b"", None, "local")
+    assert verify_get_resp.status == 405
+    assert verify_get_resp.allow == "POST"
+
 
 def test_http_server_head_health_and_405() -> None:
     app = SciGraphApp(_build_populated_graph())
     with _running_server(app) as base_url:
+        get_status, get_headers, get_body = _http_request(f"{base_url}/health")
+        assert get_status == 200
+
         status, headers, body = _http_request(
             f"{base_url}/health",
             method="HEAD",
@@ -671,7 +686,8 @@ def test_http_server_head_health_and_405() -> None:
         assert status == 200
         assert body == ""
         assert headers["content-type"] == "application/json"
-        assert headers["content-length"] == "0"
+        assert headers["content-length"] == get_headers["content-length"]
+        assert int(headers["content-length"]) == len(get_body.encode("utf-8"))
         assert headers["x-content-type-options"] == "nosniff"
         assert headers["cache-control"] == "no-store"
         assert headers["x-request-id"] == "probe-123"
@@ -683,6 +699,22 @@ def test_http_server_head_health_and_405() -> None:
         assert claims_status == 405
         assert claims_body == ""
         assert claims_headers["content-type"] == "application/json"
+        assert claims_headers["allow"] == "GET"
         assert claims_headers["x-content-type-options"] == "nosniff"
         assert claims_headers["cache-control"] == "no-store"
         assert "x-request-id" in claims_headers
+
+        health_post_status, health_post_headers, _ = _http_request(
+            f"{base_url}/health",
+            method="POST",
+            data=b"{}",
+        )
+        assert health_post_status == 405
+        assert health_post_headers["allow"] == "GET, HEAD"
+
+        verify_get_status, verify_get_headers, _ = _http_request(
+            f"{base_url}/api/v1/verify",
+            method="GET",
+        )
+        assert verify_get_status == 405
+        assert verify_get_headers["allow"] == "POST"

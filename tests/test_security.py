@@ -316,3 +316,33 @@ def test_rate_limiter_preserves_active_windows_and_fails_closed_at_cap() -> None
     clock.advance(8.0)
     assert limiter.check("c4") == (True, 0.0)
     assert set(limiter._windows.keys()) == {"c2", "c3", "c4"}
+
+
+def test_rate_limiter_cap_retry_after_uses_newest_timestamp_in_bucket() -> None:
+    clock = FakeClock(initial=0.0)
+    limiter = SlidingWindowRateLimiter(
+        max_requests=2,
+        window_seconds=10.0,
+        clock=clock,
+        max_clients=1,
+    )
+
+    assert limiter.check("c1") == (True, 0.0)
+    clock.advance(8.0)
+    assert limiter.check("c1") == (True, 0.0)
+
+    # At t=9.0, c1 has [0.0, 8.0]; eviction occurs only after newest timestamp (8.0) expires at 18.0
+    clock.advance(1.0)
+    allowed, retry_after = limiter.check("c2")
+    assert allowed is False
+    assert retry_after == pytest.approx(9.0)
+
+    # At t=10.0, 0.0 is pruned from c1 but 8.0 keeps c1 active until t=18.0
+    clock.advance(1.0)
+    allowed2, retry_after2 = limiter.check("c2")
+    assert allowed2 is False
+    assert retry_after2 == pytest.approx(8.0)
+
+    # At t=18.0, c1 is completely expired and swept, admitting c2
+    clock.advance(8.0)
+    assert limiter.check("c2") == (True, 0.0)

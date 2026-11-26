@@ -38,6 +38,7 @@ type _AddrInfoList = list[
         ("fe80::1", True),
         ("fe80::1%eth0", True),
         ("fe80::1%en0", True),
+        ("fec0::1", True),
         ("::1%lo0", True),
         ("::ffff:127.0.0.1", True),
     ],
