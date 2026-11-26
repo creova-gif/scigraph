@@ -19,6 +19,9 @@ _N_TOKEN_PATTERN = re.compile(r"^[nN]\s*=\s*(\d+)$")
 def verify_claim_verbatim(paper: Paper, claim: ScientificClaim) -> ClaimVerificationResult:
     failures: list[VerificationFailureReason] = []
 
+    if claim.paper_id != paper.paper_id:
+        failures.append(VerificationFailureReason.SPAN_OUT_OF_BOUNDS)
+
     if not DOI_PATTERN.match(claim.doi) or not DOI_PATTERN.match(paper.doi):
         failures.append(VerificationFailureReason.INVALID_DOI_FORMAT)
 

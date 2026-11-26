@@ -1,4 +1,8 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
 from itertools import combinations
+from typing import Any
 
 from ingest.verifier import verify_claim_verbatim
 from scigraph.models import (
@@ -47,6 +51,50 @@ class ClaimGraph:
         self._papers[paper.paper_id] = paper
         self._claims[claim.claim_id] = claim
         return result
+
+    def replace_paper_claims(
+        self,
+        paper: Paper,
+        claims: Sequence[ScientificClaim],
+    ) -> list[ClaimVerificationResult]:
+        """Validate all incoming claims, then atomically replace existing claims for paper."""
+        results: list[ClaimVerificationResult] = []
+        for claim in claims:
+            result = verify_claim_verbatim(paper, claim)
+            if not result.verified:
+                reasons = ", ".join(r.value for r in result.failures)
+                raise ValueError(
+                    f"Claim {claim.claim_id} failed verbatim verification: {reasons}"
+                )
+            results.append(result)
+
+        stale_ids = [
+            claim_id
+            for claim_id, existing in self._claims.items()
+            if existing.paper_id == paper.paper_id
+        ]
+        for claim_id in stale_ids:
+            del self._claims[claim_id]
+
+        self._papers[paper.paper_id] = paper
+        for claim in claims:
+            self._claims[claim.claim_id] = claim
+        return results
+
+    def remove_paper(self, paper_id: str) -> int:
+        """Remove a paper, its claims, and rebuild edges; return removed claim count."""
+        if paper_id not in self._papers:
+            raise KeyError(f"Unknown paper_id: {paper_id}")
+        del self._papers[paper_id]
+        claim_ids = [
+            claim_id
+            for claim_id, claim in self._claims.items()
+            if claim.paper_id == paper_id
+        ]
+        for claim_id in claim_ids:
+            del self._claims[claim_id]
+        self.build_edges()
+        return len(claim_ids)
 
     def build_edges(self) -> tuple[EvidenceEdge, ...]:
         self._edges.clear()
@@ -112,29 +160,86 @@ class ClaimGraph:
 
     def query_claims(
         self,
+        *,
         intervention: str | None = None,
         condition: str | None = None,
         outcome: str | None = None,
-        direction: EffectDirection | None = None,
+        effect_direction: EffectDirection | None = None,
+        paper_id: str | None = None,
     ) -> tuple[ScientificClaim, ...]:
+        """Filter claims by case-insensitive substrings and exact direction/paper_id."""
         matched: list[ScientificClaim] = []
-        norm_i = _normalize_entity(intervention) if intervention else None
-        norm_c = _normalize_entity(condition) if condition else None
-        norm_o = _normalize_entity(outcome) if outcome else None
+        needle_i = intervention.casefold() if intervention is not None else None
+        needle_c = condition.casefold() if condition is not None else None
+        needle_o = outcome.casefold() if outcome is not None else None
 
         for claim in self._claims.values():
             ct = claim.claim_tuple
-            if norm_i and _normalize_entity(ct.intervention) != norm_i:
+            if needle_i is not None and needle_i not in ct.intervention.casefold():
                 continue
-            if norm_c and _normalize_entity(ct.condition) != norm_c:
+            if needle_c is not None and needle_c not in ct.condition.casefold():
                 continue
-            if norm_o and _normalize_entity(ct.outcome) != norm_o:
+            if needle_o is not None and needle_o not in ct.outcome.casefold():
                 continue
-            if direction is not None and ct.direction != direction:
+            if effect_direction is not None and ct.direction != effect_direction:
+                continue
+            if paper_id is not None and claim.paper_id != paper_id:
                 continue
             matched.append(claim)
 
         return tuple(matched)
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize papers, claims, and edges into a JSON-compatible dictionary."""
+        return {
+            "papers": [paper.model_dump(mode="json") for paper in self._papers.values()],
+            "claims": [claim.model_dump(mode="json") for claim in self._claims.values()],
+            "edges": [edge.model_dump(mode="json") for edge in self._edges.values()],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ClaimGraph:
+        """Reconstruct and validate a ClaimGraph from a serialized dictionary."""
+        raw_papers = data.get("papers", [])
+        raw_claims = data.get("claims", [])
+        raw_edges = data.get("edges", [])
+        if (
+            not isinstance(raw_papers, list)
+            or not isinstance(raw_claims, list)
+            or not isinstance(raw_edges, list)
+        ):
+            raise ValueError(
+                "ClaimGraph dictionary requires list values for 'papers', 'claims', and 'edges'"
+            )
+
+        graph = cls()
+        for raw_paper in raw_papers:
+            paper = Paper.model_validate(raw_paper, strict=False)
+            graph._papers[paper.paper_id] = paper
+        for raw_claim in raw_claims:
+            claim = ScientificClaim.model_validate(raw_claim, strict=False)
+            graph._claims[claim.claim_id] = claim
+        for raw_edge in raw_edges:
+            edge = EvidenceEdge.model_validate(raw_edge, strict=False)
+            graph._edges[edge.edge_id] = edge
+
+        for claim in graph._claims.values():
+            if claim.paper_id not in graph._papers:
+                raise ValueError(
+                    f"Claim '{claim.claim_id}' references unknown paper_id '{claim.paper_id}'"
+                )
+        for edge in graph._edges.values():
+            if edge.source_claim_id not in graph._claims:
+                raise ValueError(
+                    f"Edge '{edge.edge_id}' references unknown "
+                    f"source_claim_id '{edge.source_claim_id}'"
+                )
+            if edge.target_claim_id not in graph._claims:
+                raise ValueError(
+                    f"Edge '{edge.edge_id}' references unknown "
+                    f"target_claim_id '{edge.target_claim_id}'"
+                )
+        return graph
 
     def edges_for_claim(self, claim_id: str) -> tuple[EvidenceEdge, ...]:
         return tuple(
