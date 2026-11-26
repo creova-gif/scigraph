@@ -130,12 +130,15 @@ scigraph protocols --store scigraph.db --output protocols.md
 
 # Diagrams & reference export
 scigraph diagram --store scigraph.db --format mermaid --output graph.mmd
+scigraph diagram --store scigraph.db --format graphml --output graph.graphml
 scigraph export-refs --store scigraph.db --format bibtex --output refs.bib
 
 # Multi-tenant workspaces
 scigraph workspace init --root .workspaces --org acme --workspace cardio --name "Cardio Workspace"
 scigraph workspace ingest --root .workspaces --org acme --workspace cardio --input path/to/corpus/
 scigraph workspace audit --root .workspaces --org acme --workspace cardio
+scigraph workspace export-bundle --root .workspaces --org acme --workspace cardio --output bundle/
+scigraph workspace remove-paper --root .workspaces --org acme --workspace cardio --paper-id paper-001 --json
 
 # Literature connectors, provenance, batch pipeline & webhook alerts
 scigraph fetch --source arxiv --query "metformin longevity" --output arxiv.json
@@ -152,13 +155,23 @@ scigraph serve --store scigraph.db --host 127.0.0.1 --port 8765
 
 | Method & Path | Description |
 | --- | --- |
-| `GET /` | Interactive HTML Claim-Graph Explorer |
-| `GET /health` | Liveness and store status check |
+| `GET /` | Interactive HTML Claim-Graph Explorer (WCAG 2.1 AA) |
+| `GET /health`, `HEAD /health` | Liveness and store status check |
+| `GET /metrics` | Server and graph operational metrics |
 | `GET /openapi.json` | OpenAPI 3.1.0 specification |
 | `GET /api/v1/claims` | Query verified `ScientificClaim` records |
 | `GET /api/v1/contradictions` | List detected `ContradictionPair` conflicts |
+| `GET /api/v1/consensus` | Compute topic-level directional consensus and claim scores |
+| `GET /api/v1/prioritize` | Rank falsifiable experiment proposals by ROI |
+| `GET /api/v1/audit` | Read workspace audit events |
 | `GET /api/v1/report` | Generate structured contradiction & experiment report |
 | `POST /api/v1/verify` | Verify submitted papers/claims (`?persist=true` with workspace binding) |
+| `DELETE /api/v1/papers/{paper_id}` | Remove a paper and its claims from the bound workspace |
+
+### Deployment & Security
+
+- **Containerization**: Build and run with [`Dockerfile`](Dockerfile) and configure environment variables using [`.env.example`](.env.example).
+- **Security Policy**: See [`SECURITY.md`](SECURITY.md) for vulnerability reporting and hardening guidance.
 
 ---
 
@@ -188,5 +201,5 @@ PYTHONPATH=src .venv/bin/python -m scigraph.cli benchmark
 
 - **Contributing**: See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, coding standards (`ruff`, `mypy --strict`, `pytest`), and PR guidelines.
 - **Changelog**: See [`CHANGELOG.md`](CHANGELOG.md) for release history.
-- **Architecture Decision Records**: See [`docs/adr/`](docs/adr/) for design rationale (`001` through `006`).
+- **Architecture Decision Records**: See [`docs/adr/`](docs/adr/) for design rationale (`001` through `007`).
 - **License**: Released under the [MIT License](LICENSE).

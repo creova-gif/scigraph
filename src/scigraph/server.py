@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import FrameType
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -43,6 +43,7 @@ _WORKSPACE_ACTIONS: tuple[WorkspaceAction, ...] = (
     "verify",
     "query",
     "export",
+    "remove",
     "contradiction_scan",
 )
 
@@ -283,6 +284,24 @@ def _build_openapi_spec() -> dict[str, Any]:
                     },
                 }
             },
+            "/api/v1/papers/{paper_id}": {
+                "delete": {
+                    "summary": "Remove a paper and its claims from the workspace graph",
+                    "parameters": [
+                        {
+                            "name": "paper_id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "responses": {
+                        "200": {"description": "Paper removed from workspace"},
+                        "400": {"description": "Invalid paper_id or unbound workspace"},
+                        "404": {"description": "Paper or workspace not found"},
+                    },
+                }
+            },
         },
     }
 
@@ -409,9 +428,11 @@ class SciGraphApp:
             and self.auth_gate.enabled
             and (path.startswith("/api/") or path == "/")
         ):
-            required_role: ApiRole = (
-                "ingestor" if (path == "/api/v1/verify" and method == "POST") else "reader"
+            requires_ingestor = (
+                (path == "/api/v1/verify" and method == "POST")
+                or (path.startswith("/api/v1/papers/") and method == "DELETE")
             )
+            required_role: ApiRole = "ingestor" if requires_ingestor else "reader"
             decision = self.auth_gate.authorize(incoming_header, required_role)
             if not decision.allowed:
                 return _error_response(decision.status_code, decision.reason)
@@ -513,6 +534,17 @@ class SciGraphApp:
                     allow="POST",
                 )
             return self._handle_verify(body, params)
+        if path.startswith("/api/v1/papers/"):
+            paper_id = unquote(path[len("/api/v1/papers/") :]).strip()
+            if not paper_id or "/" in paper_id:
+                return _error_response(HTTPStatus.BAD_REQUEST, "Invalid paper_id in path")
+            if method != "DELETE":
+                return _error_response(
+                    HTTPStatus.METHOD_NOT_ALLOWED,
+                    f"Method {method} not allowed",
+                    allow="DELETE",
+                )
+            return self._handle_remove_paper(paper_id)
 
         return _error_response(HTTPStatus.NOT_FOUND, f"Unknown route: {path}")
 
@@ -839,6 +871,43 @@ class SciGraphApp:
 
         return _json_response(HTTPStatus.OK, {"reports": reports})
 
+    def _handle_remove_paper(self, paper_id: str) -> ServerResponse:
+        if (
+            self.workspace_manager is None
+            or self.org_id is None
+            or self.workspace_id is None
+        ):
+            return _error_response(
+                HTTPStatus.BAD_REQUEST,
+                "Cannot remove paper without a configured workspace",
+            )
+
+        with self._lock:
+            try:
+                removed_claims = self.workspace_manager.remove_paper(
+                    self.org_id,
+                    self.workspace_id,
+                    paper_id,
+                )
+                self.graph = self.workspace_manager.load_graph(
+                    self.org_id,
+                    self.workspace_id,
+                )
+            except (KeyError, FileNotFoundError) as exc:
+                return _error_response(HTTPStatus.NOT_FOUND, str(exc))
+            except ValueError as exc:
+                return _error_response(HTTPStatus.BAD_REQUEST, str(exc))
+            except (OSError, sqlite3.Error) as exc:
+                return _error_response(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    f"Workspace persistence error: {exc}",
+                )
+
+        return _json_response(
+            HTTPStatus.OK,
+            {"removed_paper_id": paper_id, "removed_claims": removed_claims},
+        )
+
 
 class _SciGraphHTTPServer(ThreadingHTTPServer):
     """Hardened ThreadingHTTPServer with bounded queue, daemon threads, and address reuse."""
@@ -891,6 +960,9 @@ def create_http_server(
 
         def do_HEAD(self) -> None:
             self._handle_no_body_method("HEAD", include_body=False)
+
+        def do_DELETE(self) -> None:
+            self._handle_no_body_method("DELETE", include_body=True)
 
         def _send_transport_error(self, status: HTTPStatus, message: str) -> None:
             app.record_transport_error(status)

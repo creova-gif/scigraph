@@ -24,3 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Entity canonicalization (`graph.canonicalizer`), experiment prioritizer (`solver.prioritizer`), and webhook/alerting (`scigraph.alerts`).
 - **Wave 7 — Diagrams, Tabular/PubMed Ingestion, Protocols & Doctor (ADR-006):**
   - Mermaid and Graphviz DOT diagram generation (`scigraph.diagrams`), CSV/TSV and PubMed EFetch XML ingestion (`ingest.tabular`), experimental protocol generation (`solver.protocols`), and environment diagnostics (`scigraph.doctor`).
+- **Security:** Centralized SSRF network guards (`net_guard`) with redirect blocking, anti-eviction sliding-window rate limiting, and a documented `SECURITY.md` policy.
+- **Operations:** Shared atomic file writes (`io_utils`), SQLite WAL mode with query pushdown, RFC 9110 `HEAD /health` and `405 Allow` responses, `GET /metrics`, `Dockerfile`, and `.env.example`.
+- **Accessibility:** WCAG 2.1 AA semantics in the interactive HTML Claim-Graph Explorer (`aria-pressed`, `aria-live`, landmark regions, and keyboard-focusable tables).
+- **Lifecycle:** Workspace paper removal (`DELETE /api/v1/papers/{paper_id}` and `scigraph workspace remove-paper`), atomic compliance bundle export (`scigraph workspace export-bundle`), `GET /api/v1/consensus`, `GET /api/v1/prioritize`, `GET /api/v1/audit`, and GraphML diagram export (`scigraph diagram --format graphml`).

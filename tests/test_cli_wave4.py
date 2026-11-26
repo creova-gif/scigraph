@@ -296,6 +296,114 @@ def test_workspace_init_ingest_audit_roundtrip(
     assert "Exported workspace acme-bio/trial-alpha bundle to" in export_text_out.out
 
 
+def test_workspace_remove_paper_json_and_unknown_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "workspaces"
+    corpus = _write_json_corpus(tmp_path, count=2)
+    target_paper_id = BENCHMARK_30_PAPERS[0].paper_id
+
+    assert (
+        main(
+            [
+                "workspace",
+                "init",
+                "--root",
+                str(root),
+                "--org",
+                "acme-bio",
+                "--workspace",
+                "trial-beta",
+                "--name",
+                "Trial Beta",
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "workspace",
+                "ingest",
+                "--root",
+                str(root),
+                "--org",
+                "acme-bio",
+                "--workspace",
+                "trial-beta",
+                "--input",
+                str(corpus),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    rc_remove = main(
+        [
+            "workspace",
+            "remove-paper",
+            "--root",
+            str(root),
+            "--org",
+            "acme-bio",
+            "--workspace",
+            "trial-beta",
+            "--paper-id",
+            target_paper_id,
+            "--json",
+        ]
+    )
+    remove_out = capsys.readouterr()
+    assert rc_remove == 0
+    remove_payload = json.loads(remove_out.out)
+    assert remove_payload["org_id"] == "acme-bio"
+    assert remove_payload["workspace_id"] == "trial-beta"
+    assert remove_payload["paper_id"] == target_paper_id
+    assert remove_payload["removed_claims"] > 0
+
+    rc_audit = main(
+        [
+            "workspace",
+            "audit",
+            "--root",
+            str(root),
+            "--org",
+            "acme-bio",
+            "--workspace",
+            "trial-beta",
+            "--action",
+            "remove",
+            "--json",
+        ]
+    )
+    audit_out = capsys.readouterr()
+    assert rc_audit == 0
+    events = json.loads(audit_out.out)
+    assert len(events) == 1
+    assert events[0]["action"] == "remove"
+
+    rc_unknown = main(
+        [
+            "workspace",
+            "remove-paper",
+            "--root",
+            str(root),
+            "--org",
+            "acme-bio",
+            "--workspace",
+            "trial-beta",
+            "--paper-id",
+            "nonexistent-paper-id",
+            "--json",
+        ]
+    )
+    unknown_out = capsys.readouterr()
+    assert rc_unknown == 2
+    assert unknown_out.err != ""
+
+
 def test_wave4_error_exit_code_2(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

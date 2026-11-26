@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -9,7 +14,7 @@ import pytest
 from graph.claim_graph import ClaimGraph
 from scigraph.models import Paper
 from scigraph.security import AuthGate, TokenPolicy, hash_bearer_token
-from scigraph.server import SciGraphApp, load_token_policies
+from scigraph.server import SciGraphApp, create_http_server, load_token_policies
 from scigraph.workspace import WorkspaceManager
 
 
@@ -437,3 +442,204 @@ def test_audit_endpoint_unbound_workspace_returns_400(tmp_path: Path) -> None:
     p_status, _, p_body = partial_app.handle_request("GET", "/api/v1/audit")
     assert p_status == 400
     assert "error" in json.loads(p_body)
+
+
+@contextmanager
+def _running_server(app: SciGraphApp) -> Iterator[str]:
+    server = create_http_server("127.0.0.1", 0, app)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address[:2]
+    host_str = host.decode("ascii") if isinstance(host, bytes) else host
+    try:
+        yield f"http://{host_str}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_delete_paper_endpoint_auth_routing_and_persistence(tmp_path: Path) -> None:
+    wm = WorkspaceManager(tmp_path)
+    wm.init_workspace("org-del", "ws-del", "Delete Workspace")
+    paper_one = _make_paper(
+        paper_id="paper-del-1",
+        doi="10.5000/del.1",
+        title="Metformin Study",
+        claim_sentence=(
+            "Treatment with Metformin under normoxia increased AMPK phosphorylation "
+            "compared with vehicle (d=0.80; n=40, p<0.001)."
+        ),
+    )
+    paper_two = _make_paper(
+        paper_id="paper-del-2",
+        doi="10.5000/del.2",
+        title="Rapamycin Study",
+        claim_sentence=(
+            "Treatment with Rapamycin under standard diet increased median lifespan "
+            "compared with control (d=0.65; n=90, p<0.001)."
+        ),
+    )
+    wm.ingest_papers("org-del", "ws-del", [paper_one, paper_two])
+
+    gate = AuthGate(
+        [
+            TokenPolicy(
+                token_sha256=hash_bearer_token("del-ingestor"),
+                org_id="org-del",
+                role="ingestor",
+                label="del-ingestor",
+            ),
+            TokenPolicy(
+                token_sha256=hash_bearer_token("del-reader"),
+                org_id="org-del",
+                role="reader",
+                label="del-reader",
+            ),
+            TokenPolicy(
+                token_sha256=hash_bearer_token("other-ingestor"),
+                org_id="org-other",
+                role="ingestor",
+                label="other-ingestor",
+            ),
+        ]
+    )
+    app = SciGraphApp(
+        auth_gate=gate,
+        workspace_manager=wm,
+        org_id="org-del",
+        workspace_id="ws-del",
+    )
+
+    # 403 for reader role
+    reader_status, _, reader_body = app.handle_request(
+        "DELETE",
+        "/api/v1/papers/paper-del-1",
+        incoming_header="Bearer del-reader",
+    )
+    assert reader_status == 403
+    assert "error" in json.loads(reader_body)
+
+    # 403 for cross-org token
+    cross_status, _, cross_body = app.handle_request(
+        "DELETE",
+        "/api/v1/papers/paper-del-1",
+        incoming_header="Bearer other-ingestor",
+    )
+    assert cross_status == 403
+    assert "org_id" in json.loads(cross_body)["error"]
+
+    # 405 with Allow: DELETE on GET
+    get_resp = app._dispatch(
+        "GET",
+        "/api/v1/papers/paper-del-1",
+        b"",
+        "Bearer del-ingestor",
+        "127.0.0.1",
+    )
+    assert get_resp.status == 405
+    assert get_resp.allow == "DELETE"
+
+    # 400 on invalid paper_id (empty or containing '/')
+    for bad_path in (
+        "/api/v1/papers/",
+        "/api/v1/papers/%20",
+        "/api/v1/papers/a/b",
+        "/api/v1/papers/a%2Fb",
+    ):
+        bad_status, _, bad_body = app.handle_request(
+            "DELETE",
+            bad_path,
+            incoming_header="Bearer del-ingestor",
+        )
+        assert bad_status == 400
+        assert "error" in json.loads(bad_body)
+
+    # 404 on unknown paper
+    missing_status, _, missing_body = app.handle_request(
+        "DELETE",
+        "/api/v1/papers/does-not-exist",
+        incoming_header="Bearer del-ingestor",
+    )
+    assert missing_status == 404
+    assert "error" in json.loads(missing_body)
+
+    # 200 removes paper and reloads in-memory graph + persists + records audit
+    ok_status, ok_ctype, ok_body = app.handle_request(
+        "DELETE",
+        "/api/v1/papers/paper-del-1",
+        incoming_header="Bearer del-ingestor",
+    )
+    assert ok_status == 200
+    assert ok_ctype == "application/json"
+    assert json.loads(ok_body) == {
+        "removed_paper_id": "paper-del-1",
+        "removed_claims": 1,
+    }
+
+    health_status, _, health_body = app.handle_request(
+        "GET",
+        "/health",
+        incoming_header="Bearer del-reader",
+    )
+    assert health_status == 200
+    assert json.loads(health_body)["papers"] == 1
+    assert json.loads(health_body)["claims"] == 1
+
+    reloaded = wm.load_graph("org-del", "ws-del")
+    assert [p.paper_id for p in reloaded.papers] == ["paper-del-2"]
+
+    audit_status, _, audit_body = app.handle_request(
+        "GET",
+        "/api/v1/audit?action=remove",
+        incoming_header="Bearer del-reader",
+    )
+    assert audit_status == 200
+    remove_events = json.loads(audit_body)["events"]
+    assert len(remove_events) == 1
+    assert remove_events[0]["action"] == "remove"
+
+    # OpenAPI spec advertises /api/v1/papers/{paper_id}
+    spec_status, _, spec_body = app.handle_request(
+        "GET",
+        "/openapi.json",
+        incoming_header="Bearer del-reader",
+    )
+    assert spec_status == 200
+    assert "/api/v1/papers/{paper_id}" in json.loads(spec_body)["paths"]
+
+    # Live HTTP DELETE request removes remaining paper
+    with _running_server(app) as base_url:
+        req = urllib.request.Request(
+            f"{base_url}/api/v1/papers/paper-del-2",
+            method="DELETE",
+            headers={"Authorization": "Bearer del-ingestor"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+            live_payload = json.loads(resp.read().decode("utf-8"))
+            assert live_payload == {
+                "removed_paper_id": "paper-del-2",
+                "removed_claims": 1,
+            }
+
+        # Live HTTP GET on /api/v1/papers/<id> returns 405 with Allow: DELETE
+        get_req = urllib.request.Request(
+            f"{base_url}/api/v1/papers/paper-del-2",
+            method="GET",
+            headers={"Authorization": "Bearer del-reader"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(get_req, timeout=5)
+        assert exc_info.value.code == 405
+        assert exc_info.value.headers.get("Allow") == "DELETE"
+
+    assert len(wm.load_graph("org-del", "ws-del").papers) == 0
+
+
+def test_delete_paper_unbound_workspace_returns_400() -> None:
+    unbound_app = SciGraphApp()
+    status, ctype, body = unbound_app.handle_request("DELETE", "/api/v1/papers/paper-1")
+    assert status == 400
+    assert ctype == "application/json"
+    assert "error" in json.loads(body)

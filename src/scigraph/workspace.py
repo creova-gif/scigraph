@@ -22,7 +22,7 @@ from scigraph.models import Paper, PaperVerificationReport
 if TYPE_CHECKING:
     from scigraph.provenance import ProvenanceManifest
 
-WorkspaceAction = Literal["ingest", "verify", "query", "export", "contradiction_scan"]
+WorkspaceAction = Literal["ingest", "verify", "query", "export", "remove", "contradiction_scan"]
 AuditStatus = Literal["ok", "rejected", "error"]
 
 _SLUG_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}$")
@@ -254,6 +254,27 @@ class WorkspaceManager:
         ws_dir = self._resolve_workspace_dir(org_id, workspace_id)
         store = GraphSQLiteStore(ws_dir / "graph.db")
         return store.load_graph()
+
+    def remove_paper(self, org_id: str, workspace_id: str, paper_id: str) -> int:
+        """Remove a paper and its claims from the workspace graph and record an audit event."""
+        self.get_workspace(org_id, workspace_id)
+        ws_dir = self._resolve_workspace_dir(org_id, workspace_id)
+
+        with _workspace_lock(ws_dir):
+            store = GraphSQLiteStore(ws_dir / "graph.db")
+            graph = store.load_graph()
+            removed_claims = graph.remove_paper(paper_id)
+            store.save_graph(graph)
+            self.record_event(
+                org_id=org_id,
+                workspace_id=workspace_id,
+                action="remove",
+                paper_count=1,
+                claim_count=removed_claims,
+                status="ok",
+                detail=f"Removed paper '{paper_id}' ({removed_claims} claim(s))",
+            )
+        return removed_claims
 
     def record_event(
         self,

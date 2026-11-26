@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import scigraph.workspace as workspace_module
+from graph.claim_graph import ClaimGraph
 from graph.store import load_graph_json
 from ingest.extractor import extract_claims_from_paper
 from scigraph.cli import main
@@ -636,4 +637,107 @@ def test_export_workspace_bundle_rejects_workspace_or_subdir_output_dir(tmp_path
         match="Export output_dir must not be inside the source workspace directory",
     ):
         manager.export_workspace_bundle("org-safe", "ws-safe", ws_dir / "nested" / "bundle")
+
+
+def test_claim_graph_remove_paper_and_unknown_paper() -> None:
+    p1 = _make_paper(
+        paper_id="p-cg-1",
+        doi="10.5555/cg.001",
+        sentence=(
+            "Treatment with Metformin under normoxia decreased blood glucose "
+            "compared with placebo (mean diff -1.4 mmol/L; n = 120, p < 0.001).\n"
+            "Treatment with Metformin under hypoxia increased lactate "
+            "compared with placebo (mean diff +0.6 mmol/L; n = 120, p = 0.01)."
+        ),
+    )
+    p2 = _make_paper(
+        paper_id="p-cg-2",
+        doi="10.5555/cg.002",
+        sentence=(
+            "Treatment with Metformin under normoxia increased blood glucose "
+            "compared with placebo (mean diff +0.9 mmol/L; n = 64, p = 0.02)."
+        ),
+    )
+    p3 = _make_paper(
+        paper_id="p-cg-3",
+        doi="10.5555/cg.003",
+        sentence=(
+            "Treatment with Metformin under normoxia decreased blood glucose "
+            "compared with placebo (mean diff -1.1 mmol/L; n = 90, p < 0.01)."
+        ),
+    )
+
+    graph = ClaimGraph()
+    for paper in (p1, p2, p3):
+        claims = extract_claims_from_paper(paper)
+        graph.replace_paper_claims(paper, claims)
+    graph.build_edges()
+
+    assert len(graph.papers) == 3
+    assert len(graph.claims) == 4
+    assert len(graph.edges) == 3
+
+    removed_count = graph.remove_paper("p-cg-1")
+    assert removed_count == 2
+    assert sorted(p.paper_id for p in graph.papers) == ["p-cg-2", "p-cg-3"]
+    assert sorted(c.paper_id for c in graph.claims) == ["p-cg-2", "p-cg-3"]
+    assert len(graph.edges) == 1
+    assert graph.edges[0].relation == EdgeRelation.CONTRADICTS
+
+    with pytest.raises(KeyError, match="Unknown paper_id: p-does-not-exist"):
+        graph.remove_paper("p-does-not-exist")
+
+
+def test_workspace_remove_paper_cleans_graph_and_logs_audit(tmp_path: Path) -> None:
+    manager = WorkspaceManager(tmp_path)
+    manager.init_workspace("org-rem", "ws-rem", "Removal Workspace")
+
+    p_retracted = _make_paper(
+        paper_id="p-retracted",
+        doi="10.5555/rem.001",
+        sentence=(
+            "Treatment with Metformin under normoxia decreased blood glucose "
+            "compared with placebo (mean diff -1.4 mmol/L; n = 120, p < 0.001).\n"
+            "Treatment with Metformin under hypoxia increased lactate "
+            "compared with placebo (mean diff +0.6 mmol/L; n = 120, p = 0.01)."
+        ),
+    )
+    p_keep_a = _make_paper(
+        paper_id="p-keep-a",
+        doi="10.5555/rem.002",
+        sentence=(
+            "Treatment with Metformin under normoxia increased blood glucose "
+            "compared with placebo (mean diff +0.9 mmol/L; n = 64, p = 0.02)."
+        ),
+    )
+    p_keep_b = _make_paper(
+        paper_id="p-keep-b",
+        doi="10.5555/rem.003",
+        sentence=(
+            "Treatment with Metformin under normoxia decreased blood glucose "
+            "compared with placebo (mean diff -1.1 mmol/L; n = 90, p < 0.01)."
+        ),
+    )
+
+    manager.ingest_papers("org-rem", "ws-rem", [p_retracted, p_keep_a, p_keep_b])
+
+    with pytest.raises(KeyError, match="Unknown paper_id: p-unknown"):
+        manager.remove_paper("org-rem", "ws-rem", "p-unknown")
+    assert manager.read_audit_log("org-rem", "ws-rem", action="remove") == []
+
+    removed_claims = manager.remove_paper("org-rem", "ws-rem", "p-retracted")
+    assert removed_claims == 2
+
+    reloaded = manager.load_graph("org-rem", "ws-rem")
+    assert sorted(p.paper_id for p in reloaded.papers) == ["p-keep-a", "p-keep-b"]
+    assert sorted(c.paper_id for c in reloaded.claims) == ["p-keep-a", "p-keep-b"]
+    assert len(reloaded.edges) == 1
+    assert reloaded.edges[0].relation == EdgeRelation.CONTRADICTS
+
+    remove_events = manager.read_audit_log("org-rem", "ws-rem", action="remove")
+    assert len(remove_events) == 1
+    assert remove_events[0].paper_count == 1
+    assert remove_events[0].claim_count == 2
+    assert remove_events[0].status == "ok"
+    assert "p-retracted" in remove_events[0].detail
 

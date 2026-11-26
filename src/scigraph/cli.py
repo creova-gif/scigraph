@@ -268,7 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
     ws_audit.add_argument("--workspace", type=str, required=True, help="Workspace ID slug.")
     ws_audit.add_argument(
         "--action",
-        choices=("ingest", "verify", "query", "export", "contradiction_scan"),
+        choices=("ingest", "verify", "query", "export", "contradiction_scan", "remove"),
         default=None,
         help="Filter audit events by action.",
     )
@@ -297,6 +297,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Emit ProvenanceManifest as JSON.",
+    )
+
+    ws_remove = ws_sub.add_parser(
+        "remove-paper",
+        help="Remove a paper and its claims from a tenant workspace.",
+    )
+    ws_remove.add_argument("--root", type=str, required=True, help="Workspace root directory.")
+    ws_remove.add_argument("--org", type=str, required=True, help="Organization ID slug.")
+    ws_remove.add_argument("--workspace", type=str, required=True, help="Workspace ID slug.")
+    ws_remove.add_argument("--paper-id", type=str, required=True, help="Paper ID to remove.")
+    ws_remove.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit removal summary as JSON.",
     )
 
     fetch_p = sub.add_parser("fetch", help="Fetch papers from external scientific APIs.")

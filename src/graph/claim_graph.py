@@ -81,6 +81,21 @@ class ClaimGraph:
             self._claims[claim.claim_id] = claim
         return results
 
+    def remove_paper(self, paper_id: str) -> int:
+        """Remove a paper, its claims, and rebuild edges; return removed claim count."""
+        if paper_id not in self._papers:
+            raise KeyError(f"Unknown paper_id: {paper_id}")
+        del self._papers[paper_id]
+        claim_ids = [
+            claim_id
+            for claim_id, claim in self._claims.items()
+            if claim.paper_id == paper_id
+        ]
+        for claim_id in claim_ids:
+            del self._claims[claim_id]
+        self.build_edges()
+        return len(claim_ids)
+
     def build_edges(self) -> tuple[EvidenceEdge, ...]:
         self._edges.clear()
         groups: dict[tuple[str, str], list[ScientificClaim]] = {}

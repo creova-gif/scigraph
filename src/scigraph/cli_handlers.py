@@ -648,7 +648,29 @@ def _cmd_workspace(args: argparse.Namespace) -> int:
                     f"graph_sha256={manifest.graph_sha256})\n"
                 )
             return 0
-    except (ValueError, FileNotFoundError, OSError, sqlite3.Error) as exc:
+
+        if action == "remove-paper":
+            paper_id = str(args.paper_id)
+            removed_claims = manager.remove_paper(
+                org_id=org_id,
+                workspace_id=workspace_id,
+                paper_id=paper_id,
+            )
+            if as_json:
+                summary = {
+                    "org_id": org_id,
+                    "workspace_id": workspace_id,
+                    "paper_id": paper_id,
+                    "removed_claims": removed_claims,
+                }
+                sys.stdout.write(json.dumps(summary, sort_keys=True, indent=2) + "\n")
+            else:
+                sys.stdout.write(
+                    f"Removed paper '{paper_id}' from {org_id}/{workspace_id} "
+                    f"({removed_claims} claim(s))\n"
+                )
+            return 0
+    except (KeyError, ValueError, FileNotFoundError, OSError, sqlite3.Error) as exc:
         sys.stderr.write(f"Workspace command '{action}' failed: {exc}\n")
         return 2
 
