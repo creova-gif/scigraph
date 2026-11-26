@@ -304,3 +304,136 @@ def test_app_init_rejects_both_graph_and_workspace_manager(tmp_path: Path) -> No
         match="Cannot configure both an explicit graph and a workspace_manager",
     ):
         SciGraphApp(graph, workspace_manager=wm, org_id="org-dup", workspace_id="ws-dup")
+
+
+def test_audit_endpoint_returns_events_with_filters_and_auth(tmp_path: Path) -> None:
+    wm = WorkspaceManager(tmp_path)
+    wm.init_workspace("org-audit", "ws-audit", "Audit Workspace")
+    paper_one = _make_paper(
+        paper_id="paper-audit-1",
+        doi="10.4000/audit.1",
+        title="Audit Study One",
+        claim_sentence=(
+            "Treatment with Metformin under normoxia increased AMPK phosphorylation "
+            "compared with vehicle (d=0.80; n=40, p<0.001)."
+        ),
+    )
+    paper_two = _make_paper(
+        paper_id="paper-audit-2",
+        doi="10.4000/audit.2",
+        title="Audit Study Two",
+        claim_sentence=(
+            "Treatment with Rapamycin under standard diet increased median lifespan "
+            "compared with control (d=0.65; n=90, p<0.001)."
+        ),
+    )
+    wm.ingest_papers("org-audit", "ws-audit", [paper_one])
+    wm.ingest_papers("org-audit", "ws-audit", [paper_two])
+    wm.record_event(
+        "org-audit",
+        "ws-audit",
+        action="verify",
+        paper_count=1,
+        claim_count=1,
+        status="ok",
+        detail="manual verify event",
+    )
+
+    gate = AuthGate(
+        [
+            TokenPolicy(
+                token_sha256=hash_bearer_token("audit-reader"),
+                org_id="org-audit",
+                role="reader",
+                label="audit-reader",
+            ),
+            TokenPolicy(
+                token_sha256=hash_bearer_token("other-org-reader"),
+                org_id="org-other",
+                role="reader",
+                label="other-org-reader",
+            ),
+        ]
+    )
+    app = SciGraphApp(
+        auth_gate=gate,
+        workspace_manager=wm,
+        org_id="org-audit",
+        workspace_id="ws-audit",
+    )
+
+    # 200 all events
+    status_all, ctype_all, body_all = app.handle_request(
+        "GET",
+        "/api/v1/audit",
+        incoming_header="Bearer audit-reader",
+    )
+    assert status_all == 200
+    assert ctype_all == "application/json"
+    all_events = json.loads(body_all)["events"]
+    assert len(all_events) == 4
+
+    # 200 ?action=ingest
+    status_ingest, _, body_ingest = app.handle_request(
+        "GET",
+        "/api/v1/audit?action=ingest",
+        incoming_header="Bearer audit-reader",
+    )
+    assert status_ingest == 200
+    ingest_events = json.loads(body_ingest)["events"]
+    assert len(ingest_events) == 2
+    assert all(evt["action"] == "ingest" for evt in ingest_events)
+
+    # 200 ?limit=1 returns most recent event
+    status_limit, _, body_limit = app.handle_request(
+        "GET",
+        "/api/v1/audit?limit=1",
+        incoming_header="Bearer audit-reader",
+    )
+    assert status_limit == 200
+    limit_events = json.loads(body_limit)["events"]
+    assert len(limit_events) == 1
+    assert limit_events[0]["action"] == "verify"
+
+    # 403 cross-org token rejection
+    status_cross, _, body_cross = app.handle_request(
+        "GET",
+        "/api/v1/audit",
+        incoming_header="Bearer other-org-reader",
+    )
+    assert status_cross == 403
+    assert "org_id" in json.loads(body_cross)["error"]
+
+    # 400 invalid action and invalid limit
+    for bad_target in (
+        "/api/v1/audit?action=delete",
+        "/api/v1/audit?limit=abc",
+        "/api/v1/audit?limit=0",
+        "/api/v1/audit?limit=-3",
+    ):
+        bad_status, _, bad_body = app.handle_request(
+            "GET",
+            bad_target,
+            incoming_header="Bearer audit-reader",
+        )
+        assert bad_status == 400
+        assert "error" in json.loads(bad_body)
+
+    # OpenAPI spec advertises /api/v1/audit
+    spec_status, _, spec_body = app.handle_request("GET", "/openapi.json")
+    assert spec_status == 200
+    assert "/api/v1/audit" in json.loads(spec_body)["paths"]
+
+
+def test_audit_endpoint_unbound_workspace_returns_400(tmp_path: Path) -> None:
+    unbound_app = SciGraphApp()
+    status, ctype, body = unbound_app.handle_request("GET", "/api/v1/audit")
+    assert status == 400
+    assert ctype == "application/json"
+    assert "error" in json.loads(body)
+
+    wm = WorkspaceManager(tmp_path)
+    partial_app = SciGraphApp(workspace_manager=wm, org_id="org-only")
+    p_status, _, p_body = partial_app.handle_request("GET", "/api/v1/audit")
+    assert p_status == 400
+    assert "error" in json.loads(p_body)

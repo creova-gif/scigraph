@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import signal
 import sqlite3
 import threading
 import time
@@ -10,6 +11,7 @@ from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import FrameType
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -28,7 +30,7 @@ from scigraph.exporters import (
 )
 from scigraph.models import EffectDirection, Paper
 from scigraph.security import ApiRole, AuthGate, SlidingWindowRateLimiter, TokenPolicy
-from scigraph.workspace import WorkspaceManager
+from scigraph.workspace import WorkspaceAction, WorkspaceManager
 from solver.prioritizer import prioritize_experiments
 from solver.symbolic import detect_contradictions, propose_falsifiable_experiments
 
@@ -36,6 +38,13 @@ MAX_REQUEST_BYTES = 2 * 1024 * 1024
 _API_VERSION = "0.1.0"
 _SQLITE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_WORKSPACE_ACTIONS: tuple[WorkspaceAction, ...] = (
+    "ingest",
+    "verify",
+    "query",
+    "export",
+    "contradiction_scan",
+)
 
 
 def _sanitize_request_id(raw: str | None) -> str:
@@ -202,6 +211,31 @@ def _build_openapi_spec() -> dict[str, Any]:
                     "responses": {
                         "200": {"description": "Rendered report"},
                         "400": {"description": "Unsupported report format"},
+                    },
+                }
+            },
+            "/api/v1/audit": {
+                "get": {
+                    "summary": "Read workspace audit log events",
+                    "parameters": [
+                        {
+                            "name": "action",
+                            "in": "query",
+                            "schema": {
+                                "type": "string",
+                                "enum": list(_WORKSPACE_ACTIONS),
+                            },
+                        },
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "schema": {"type": "integer", "minimum": 1},
+                        },
+                    ],
+                    "responses": {
+                        "200": {"description": "Workspace audit events"},
+                        "400": {"description": "Unbound workspace or invalid query parameter"},
+                        "404": {"description": "Workspace not found"},
                     },
                 }
             },
@@ -448,6 +482,8 @@ class SciGraphApp:
             return self._require_get(method, lambda: self._handle_prioritize())
         if path == "/api/v1/report":
             return self._require_get(method, lambda: self._handle_report(params))
+        if path == "/api/v1/audit":
+            return self._require_get(method, lambda: self._handle_audit(params))
         if path == "/api/v1/verify":
             if method != "POST":
                 return _error_response(
@@ -636,6 +672,67 @@ class SciGraphApp:
         if normalized in {"false", "0", "no"}:
             return False
         return None
+
+    def _handle_audit(self, params: dict[str, list[str]]) -> ServerResponse:
+        if (
+            self.workspace_manager is None
+            or self.org_id is None
+            or self.workspace_id is None
+        ):
+            return _error_response(
+                HTTPStatus.BAD_REQUEST,
+                "Cannot read audit log without a configured workspace",
+            )
+
+        action: WorkspaceAction | None = None
+        action_raw = _first_param(params, "action")
+        if action_raw is not None:
+            matched_action = next((a for a in _WORKSPACE_ACTIONS if a == action_raw), None)
+            if matched_action is None:
+                valid = ", ".join(_WORKSPACE_ACTIONS)
+                return _error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    f"Invalid action {action_raw!r}; expected one of: {valid}",
+                )
+            action = matched_action
+
+        limit: int | None = None
+        limit_raw = _first_param(params, "limit")
+        if limit_raw is not None:
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                return _error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    f"Invalid limit {limit_raw!r}; expected an integer >= 1",
+                )
+            if limit < 1:
+                return _error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    f"Invalid limit {limit_raw!r}; expected an integer >= 1",
+                )
+
+        try:
+            events = self.workspace_manager.read_audit_log(
+                self.org_id,
+                self.workspace_id,
+                action=action,
+                limit=limit,
+            )
+        except FileNotFoundError as exc:
+            return _error_response(HTTPStatus.NOT_FOUND, str(exc))
+        except ValueError as exc:
+            return _error_response(HTTPStatus.BAD_REQUEST, str(exc))
+        except OSError as exc:
+            return _error_response(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"Workspace audit read error: {exc}",
+            )
+
+        return _json_response(
+            HTTPStatus.OK,
+            {"events": [event.model_dump(mode="json") for event in events]},
+        )
 
     def _handle_verify(self, body: bytes, params: dict[str, list[str]]) -> ServerResponse:
         if len(body) > MAX_REQUEST_BYTES:
@@ -885,9 +982,19 @@ def run_server(
     graph = _load_graph_from_store(store_path) if store_path is not None else ClaimGraph()
     app = SciGraphApp(graph=graph)
     server = create_http_server(host, port, app)
+    is_main_thread = threading.current_thread() is threading.main_thread()
+    previous_sigterm: Any = None
+    if is_main_thread:
+        def _handle_sigterm(signum: int, frame: FrameType | None) -> None:
+            del signum, frame
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+        previous_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if is_main_thread and previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         server.server_close()

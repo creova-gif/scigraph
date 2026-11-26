@@ -1,0 +1,5 @@
+# Default code owners for all paths
+* @creova-gif
+
+# GitHub workflows and governance configuration
+.github/ @creova-gif
