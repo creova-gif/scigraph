@@ -11,6 +11,9 @@ dependencies = [
     "pydantic>=2.9",
 ]
 
+[project.scripts]
+scigraph = "scigraph.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",

@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -5,6 +8,7 @@ from evals import (
     BENCHMARK_30_PAPERS,
     build_adversarial_decoy_claims,
     evaluate_benchmark,
+    run_benchmark_audit,
 )
 from graph import ClaimGraph
 from ingest import (
@@ -16,18 +20,33 @@ from ingest import (
     verify_claim_verbatim,
     verify_paper_claims,
 )
+from ingest.extractor import MAX_PDF_BYTES
+from scigraph.cli import main
+from scigraph.explorer import render_claim_graph_html
+from scigraph.exporters import export_sarif_v210
 from scigraph.models import (
+    ClaimTuple,
+    ClaimVerificationResult,
+    ComparisonOperator,
     ContradictionKind,
     EdgeRelation,
+    EffectDirection,
     EvidenceEdge,
     EvidenceSpan,
     Paper,
+    PaperVerificationReport,
+    ScientificClaim,
     SectionKind,
+    StatisticalEvidence,
     VerificationFailureReason,
 )
 from solver import (
     check_claim_set_satisfiability,
+    compute_powered_sample_size,
+    compute_regime_delta,
     detect_contradictions,
+    extract_regime_parameters,
+    parse_standardized_effect_size,
     propose_falsifiable_experiments,
 )
 
@@ -158,3 +177,187 @@ def test_30_paper_benchmark_exceeds_acceptance_thresholds() -> None:
     assert metrics.adversarial_decoys_rejected == 150
     assert metrics.contradictions_detected >= 6
     assert metrics.experiments_proposed == metrics.contradictions_detected
+
+
+def test_pdf_binary_header_size_limit_and_flatedecode_errors() -> None:
+    blocks = OPEN_ACCESS_5_PDF_LAYOUTS["arxiv-2401.10101"]
+    base_pdf = render_blocks_to_pdf_bytes(blocks)
+    binary_pdf = base_pdf.replace(b"%PDF-1.4\n", b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n", 1)
+    paper = extract_paper_from_pdf_bytes("arxiv-2401.10101", binary_pdf)
+    assert paper.doi == "10.48550/arXiv.2401.10101"
+
+    with pytest.raises(ValueError, match="MAX_PDF_BYTES"):
+        extract_paper_from_pdf_bytes("oversized", b"%PDF-1.4\n" + b"0" * MAX_PDF_BYTES)
+
+    with pytest.raises(ValueError, match="Invalid PDF header"):
+        extract_paper_from_pdf_bytes("bad-magic", b"NOT-A-PDF")
+
+    compressed_pdf = (
+        b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+        b"1 0 obj << /Filter /FlateDecode >> stream\nxyz\nendstream"
+    )
+    with pytest.raises(ValueError, match="/FlateDecode"):
+        extract_paper_from_pdf_bytes("compressed", compressed_pdf)
+
+
+def test_quantitative_regime_delta_and_power_calculator() -> None:
+    temp_delta = compute_regime_delta(
+        "Aedes aegypti midgut at 28 C",
+        "37 C larval thermal heatwave stress",
+    )
+    assert temp_delta is not None
+    assert "+9 C" in temp_delta
+
+    kelvin_delta = compute_regime_delta("reaction at 300 K", "reaction at 310 K")
+    assert kelvin_delta is not None
+    assert "+10 C" in kelvin_delta
+
+    molar_delta = compute_regime_delta("500 mM NaCl", "1.0 M NaCl")
+    assert molar_delta is not None
+    assert "+0.5 M" in molar_delta
+
+    cross_delta = compute_regime_delta("65% relative humidity", "130 C oxidative regeneration")
+    assert cross_delta is not None
+    assert "Cross-dimension regime shift" in cross_delta
+
+    c_rate_params = extract_regime_parameters("2C charge cycling")
+    assert len(c_rate_params) == 1
+    assert c_rate_params[0].dimension == "c_rate"
+
+    assert parse_standardized_effect_size("d = -0.30") == pytest.approx(0.30)
+    assert parse_standardized_effect_size("reduction = 58%") == pytest.approx(1.16)
+    assert parse_standardized_effect_size("fold = -2.0x") is None
+
+    def _make_claim(cid: str, n: int, eff: str | None) -> ScientificClaim:
+        quote = f"Treatment with X under Y increased Z compared with C (n = {n}, p = 0.01)."
+        return ScientificClaim(
+            claim_id=cid,
+            paper_id="p1",
+            doi="10.48550/arXiv.2401.10101",
+            claim_tuple=ClaimTuple(
+                intervention="X",
+                condition="Y",
+                outcome="Z",
+                direction=EffectDirection.INCREASES,
+            ),
+            statistics=StatisticalEvidence(
+                p_operator=ComparisonOperator.EQ,
+                p_value=0.01,
+                p_value_raw="p = 0.01",
+                sample_size=n,
+                sample_size_raw=f"n = {n}",
+                effect_size_raw=eff,
+            ),
+            evidence_span=EvidenceSpan(
+                section=SectionKind.RESULTS,
+                start_char=0,
+                end_char=len(quote),
+                verbatim_text=quote,
+            ),
+        )
+
+    small_d_n = compute_powered_sample_size(
+        _make_claim("c1", 20, "d = 0.30"),
+        _make_claim("c2", 20, "d = 0.30"),
+    )
+    large_d_n = compute_powered_sample_size(
+        _make_claim("c1", 20, "d = 1.20"),
+        _make_claim("c2", 20, "d = 1.20"),
+    )
+    null_d_n = compute_powered_sample_size(
+        _make_claim("c1", 25, None),
+        _make_claim("c2", 30, None),
+    )
+    assert small_d_n > large_d_n
+    assert null_d_n == 60
+
+
+def test_exporters_html_explorer_and_cli_integration(tmp_path: Path) -> None:
+    tmp_dir = tmp_path
+    bundle = run_benchmark_audit()
+
+    sarif_str = export_sarif_v210(
+        bundle.contradictions,
+        reports=(
+            PaperVerificationReport(
+                paper_id="bad-paper",
+                doi="10.1000/bad",
+                doi_verified=False,
+                claim_results=(
+                    ClaimVerificationResult(
+                        claim_id="bad-c1",
+                        paper_id="bad-paper",
+                        verified=False,
+                        failures=(VerificationFailureReason.DOI_NOT_VERBATIM_IN_SOURCE,),
+                    ),
+                ),
+                verified_claims=(),
+                rejected_claim_ids=("bad-c1",),
+                elapsed_ms=0.1,
+            ),
+        ),
+    )
+    sarif = json.loads(sarif_str)
+    assert sarif["version"] == "2.1.0"
+    rule_ids = {r["ruleId"] for r in sarif["runs"][0]["results"]}
+    assert {"SCIGRAPH-VERIFY-001", "SCIGRAPH-CONTRA-001", "SCIGRAPH-CONTRA-002"} <= rule_ids
+
+    empty_html = render_claim_graph_html(ClaimGraph(), (), (), None)
+    assert "empty-state" in empty_html
+
+    xss_graph = ClaimGraph()
+    xss_text_a = (
+        'Title: <script>alert("xss")</script>\nDOI: 10.48550/arXiv.2401.99998\n'
+        'Abstract: Treatment with <script>alert("xss")</script> under 28 C '
+        "increased <img src=x> compared with control (n = 40, p = 0.01)."
+    )
+    xss_text_b = (
+        'Title: <script>alert("xss")</script>\nDOI: 10.48550/arXiv.2401.99999\n'
+        'Abstract: Treatment with <script>alert("xss")</script> under 28 C '
+        "decreased <img src=x> compared with control (n = 40, p = 0.01)."
+    )
+    for pid, doi, txt in (
+        ("xss-1", "10.48550/arXiv.2401.99998", xss_text_a),
+        ("xss-2", "10.48550/arXiv.2401.99999", xss_text_b),
+    ):
+        xss_paper = Paper(
+            paper_id=pid,
+            doi=doi,
+            title='<script>alert("xss")</script>',
+            authors=("Alice",),
+            publication_year=2024,
+            venue="arXiv",
+            full_text=txt,
+        )
+        for c in extract_claims_from_paper(xss_paper):
+            xss_graph.add_verified_claim(xss_paper, c)
+    xss_graph.build_edges()
+    xss_contras = detect_contradictions(xss_graph)
+    xss_exps = propose_falsifiable_experiments(xss_contras)
+    xss_html = render_claim_graph_html(xss_graph, xss_contras, xss_exps, None)
+    assert '<script>alert("xss")</script>' not in xss_html
+    assert "&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;" in xss_html
+
+    assert main(["benchmark"]) == 0
+    assert main(["verify", "--paper-id", "unknown-id"]) == 2
+
+    out_sarif = tmp_dir / "out.sarif"
+    rc_report = main(
+        [
+            "report",
+            "--format",
+            "sarif",
+            "--output",
+            str(out_sarif),
+            "--fail-on-contradictions",
+        ]
+    )
+    assert rc_report == 1
+    assert out_sarif.exists()
+
+    out_html = tmp_dir / "studio.html"
+    assert main(["report", "--format", "html", "--output", str(out_html)]) == 0
+    assert "SciGraph Claim-Graph &amp; Contradiction Studio" in out_html.read_text(encoding="utf-8")
+
+    missing_out = tmp_dir / "missing_dir" / "out.json"
+    assert main(["report", "--format", "json", "--output", str(missing_out)]) == 2

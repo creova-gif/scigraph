@@ -1,3 +1,5 @@
+import math
+import re
 from collections.abc import Sequence
 from itertools import combinations
 from typing import assert_never
@@ -11,6 +13,64 @@ from scigraph.models import (
     ScientificClaim,
     _normalize_entity,
 )
+from solver.regime import compute_regime_delta
+
+_D_EFFECT_PATTERN = re.compile(r"\b(?:d|diff)\s*=\s*(?P<val>[+-]?\d+(?:\.\d+)?)")
+_FOLD_PATTERN = re.compile(r"\bfold\s*=\s*(?P<val>[+-]?\d+(?:\.\d+)?)x")
+_RATIO_PATTERN = re.compile(r"\b(?:or|hr|ratio)\s*=\s*(?P<val>[+-]?\d+(?:\.\d+)?)")
+_PCT_PATTERN = re.compile(r"\b(?:reduction|delta)\s*=\s*(?P<val>[+-]?\d+(?:\.\d+)?)%")
+
+_Z_ALPHA_001 = 2.5758
+_Z_POWER_090 = 1.2816
+
+
+def parse_standardized_effect_size(effect_size_raw: str | None) -> float | None:
+    if effect_size_raw is None:
+        return None
+    text = effect_size_raw.strip()
+
+    d_match = _D_EFFECT_PATTERN.search(text)
+    if d_match is not None:
+        return max(0.10, min(3.0, abs(float(d_match.group("val")))))
+
+    fold_match = _FOLD_PATTERN.search(text)
+    if fold_match is not None:
+        val = float(fold_match.group("val"))
+        if val <= 0.0:
+            return None
+        return max(0.10, min(3.0, abs(math.log(val))))
+
+    ratio_match = _RATIO_PATTERN.search(text)
+    if ratio_match is not None:
+        val = float(ratio_match.group("val"))
+        if val <= 0.0:
+            return None
+        return max(0.10, min(3.0, abs(math.log(val)) * 0.55))
+
+    pct_match = _PCT_PATTERN.search(text)
+    if pct_match is not None:
+        pct = float(pct_match.group("val"))
+        return max(0.20, min(2.0, abs(pct) / 50.0))
+
+    return None
+
+
+def compute_powered_sample_size(
+    claim_a: ScientificClaim,
+    claim_b: ScientificClaim,
+) -> int:
+    base_n = max(40, max(claim_a.statistics.sample_size, claim_b.statistics.sample_size) * 2)
+    d_a = parse_standardized_effect_size(claim_a.statistics.effect_size_raw)
+    d_b = parse_standardized_effect_size(claim_b.statistics.effect_size_raw)
+
+    present = [d for d in (d_a, d_b) if d is not None]
+    if not present:
+        return base_n
+
+    d_eff = max(0.20, min(present))
+    n_per_arm = math.ceil(2.0 * ((_Z_ALPHA_001 + _Z_POWER_090) / d_eff) ** 2)
+    total_powered_n = min(2000, n_per_arm * 2)
+    return max(base_n, total_powered_n)
 
 
 def direction_to_symbolic_int(direction: EffectDirection) -> int:
@@ -94,6 +154,12 @@ def detect_contradictions(graph: ClaimGraph) -> tuple[ContradictionPair, ...]:
                     f"Regime shift between '{claim_a.claim_tuple.condition}' "
                     f"and '{claim_b.claim_tuple.condition}'"
                 )
+                delta = compute_regime_delta(
+                    claim_a.claim_tuple.condition,
+                    claim_b.claim_tuple.condition,
+                )
+                if delta is not None:
+                    discriminating = f"{discriminating} | {delta}"
                 unsat = (
                     f"Dir({norm_i}, {cond_a}, {norm_o}) == {val_a} [{claim_a.claim_id}]",
                     f"Dir({norm_i}, {cond_b}, {norm_o}) == {val_b} [{claim_b.claim_id}]",
@@ -122,8 +188,7 @@ def propose_falsifiable_experiments(
     for idx, pair in enumerate(contradictions, start=1):
         ca = pair.claim_a
         cb = pair.claim_b
-        max_n = max(ca.statistics.sample_size, cb.statistics.sample_size)
-        recommended_n = max(40, max_n * 2)
+        recommended_n = compute_powered_sample_size(ca, cb)
 
         cond_a = ca.claim_tuple.condition
         cond_b = cb.claim_tuple.condition

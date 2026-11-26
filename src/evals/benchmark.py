@@ -1,4 +1,5 @@
 import time
+from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict
 
@@ -15,15 +16,27 @@ from scigraph.models import (
     BenchmarkMetrics,
     ClaimTuple,
     ComparisonOperator,
+    ContradictionPair,
     EffectDirection,
     EvidenceSpan,
+    FalsifiableExperiment,
     LayoutBlock,
     Paper,
+    PaperVerificationReport,
     ScientificClaim,
     SectionKind,
     StatisticalEvidence,
 )
 from solver.symbolic import detect_contradictions, propose_falsifiable_experiments
+
+
+@dataclass(frozen=True, slots=True)
+class BenchmarkAuditBundle:
+    metrics: BenchmarkMetrics
+    graph: ClaimGraph
+    reports: tuple[PaperVerificationReport, ...]
+    contradictions: tuple[ContradictionPair, ...]
+    experiments: tuple[FalsifiableExperiment, ...]
 
 
 class BenchmarkPaperSpec(BaseModel):
@@ -1174,9 +1187,10 @@ def build_adversarial_decoy_claims(paper: Paper) -> tuple[ScientificClaim, ...]:
     )
 
 
-def evaluate_benchmark() -> BenchmarkMetrics:
+def run_benchmark_audit() -> BenchmarkAuditBundle:
     started = time.perf_counter()
     graph = ClaimGraph()
+    reports: list[PaperVerificationReport] = []
 
     tp = 0
     fp = 0
@@ -1194,6 +1208,7 @@ def evaluate_benchmark() -> BenchmarkMetrics:
 
         extracted = extract_claims_from_paper(paper)
         report = verify_paper_claims(paper, extracted)
+        reports.append(report)
 
         for verified_claim in report.verified_claims:
             graph.add_verified_claim(paper, verified_claim)
@@ -1239,7 +1254,7 @@ def evaluate_benchmark() -> BenchmarkMetrics:
     )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
 
-    return BenchmarkMetrics(
+    metrics = BenchmarkMetrics(
         total_papers=len(BENCHMARK_30_PAPERS),
         true_positives=tp,
         false_positives=fp,
@@ -1254,3 +1269,14 @@ def evaluate_benchmark() -> BenchmarkMetrics:
         experiments_proposed=len(experiments),
         elapsed_ms=elapsed_ms,
     )
+    return BenchmarkAuditBundle(
+        metrics=metrics,
+        graph=graph,
+        reports=tuple(reports),
+        contradictions=contradictions,
+        experiments=experiments,
+    )
+
+
+def evaluate_benchmark() -> BenchmarkMetrics:
+    return run_benchmark_audit().metrics

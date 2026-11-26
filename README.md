@@ -11,7 +11,8 @@ SciGraph ingests multi-column scientific PDFs and layout blocks, extracts typed 
 1. **Domain models (`src/scigraph/models.py`)**: Defines frozen Pydantic v2 models (`strict=True`, `frozen=True`, `extra="forbid"`) for `Paper`, `PaperSection`, `LayoutBlock`, `EvidenceSpan`, `ClaimTuple`, `StatisticalEvidence`, `ScientificClaim`, `EvidenceEdge`, `ContradictionPair`, and `FalsifiableExperiment`.
 2. **Layout-aware ingestion and verbatim verifier (`src/ingest/`)**: Orders two-column PDF layout blocks in reading order (`order_layout_blocks`, `extract_paper_from_pdf_bytes`), extracts typed claim tuples (`extract_claims_from_paper`), and runs `verify_claim_verbatim` to reject any claim whose DOI, quote slice, p-value string, or sample size `n` does not match the source text verbatim.
 3. **Claim graph (`src/graph/claim_graph.py`)**: Stores verified papers and claims, rejects unverified claims at the boundary, and builds `SUPPORTS`, `REPLICATES`, `CONTRADICTS`, and `QUALIFIES` edges across papers sharing normalized `(intervention, outcome)` pairs.
-4. **Symbolic contradiction solver (`src/solver/symbolic.py`)**: Maps claim effect directions into discrete constraints (`{-1, 0, +1}`), isolates unsatisfiable cores (`check_claim_set_satisfiability`, `detect_contradictions`), and generates powered `FalsifiableExperiment` designs (`propose_falsifiable_experiments`).
+4. **Symbolic contradiction solver (`src/solver/symbolic.py`, `src/solver/regime.py`)**: Maps claim effect directions into discrete constraints (`{-1, 0, +1}`), isolates unsatisfiable cores (`check_claim_set_satisfiability`, `detect_contradictions`), computes quantitative physical/chemical regime deltas (`compute_regime_delta`), and generates effect-size-calibrated `FalsifiableExperiment` designs (`propose_falsifiable_experiments`).
+5. **CLI, Exporters, and HTML Studio (`src/scigraph/cli.py`, `src/scigraph/exporters.py`, `src/scigraph/explorer.py`)**: Provides `benchmark`, `verify`, and `report --format {markdown,html,sarif,json}` subcommands with atomic `--output` writes, OASIS SARIF v2.1.0 CI diagnostics, and an XSS-safe interactive HTML Claim-Graph Explorer.
 
 ## Quickstart
 
@@ -21,6 +22,9 @@ Run the linter, strict type checker, and test suite in Python 3.12:
 .venv/bin/ruff check src tests
 .venv/bin/mypy --strict src tests
 .venv/bin/pytest -v
+PYTHONPATH=src .venv/bin/python -m scigraph.cli benchmark
+PYTHONPATH=src .venv/bin/python -m scigraph.cli report --format html --output scigraph-studio.html
+PYTHONPATH=src .venv/bin/python -m scigraph.cli report --format sarif --output scigraph.sarif
 ```
 
 ## Reproducible benchmark numbers
@@ -32,7 +36,7 @@ Measured on Python 3.12.12 (`pydantic 2.14.4`) across the 30-paper benchmark cor
 | Structured claim-tuple extraction F1 | >= 0.85 | **1.0000** (60 TP, 0 FP, 0 FN) | `test_30_paper_benchmark_exceeds_acceptance_thresholds` |
 | Fabricated DOIs accepted | 0 | **0** (30 / 30 fabricated DOI decoys rejected) | `test_deterministic_verifier_rejects_fabricated_doi_p_value_and_sample_size` |
 | Fabricated p-values accepted | 0 | **0** (120 / 120 fabricated p-value, sample-size, and span decoys rejected) | `test_30_paper_benchmark_exceeds_acceptance_thresholds` |
-| End-to-end 30-paper pipeline latency (median) | Deterministic local run | **4.201 ms** (range 3.132 to 5.480 ms across 7 runs) | Bound by regex tokenization and Pydantic v2 validation on 1 core |
+| End-to-end 30-paper pipeline latency (median) | Deterministic local run | **2.671 ms** (range 2.403 to 2.961 ms across 7 runs) | Bound by regex tokenization and Pydantic v2 validation on 1 core |
 
 Regenerate the benchmark numbers with:
 

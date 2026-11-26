@@ -59,6 +59,8 @@ _PDF_BLOCK_PATTERN = re.compile(
     re.DOTALL,
 )
 
+MAX_PDF_BYTES = 25 * 1024 * 1024
+
 
 def normalize_pdf_text(text: str) -> str:
     replaced = (
@@ -216,15 +218,23 @@ def extract_paper_from_pdf_bytes(
     pdf_bytes: bytes,
     page_width: float = 612.0,
 ) -> Paper:
-    decoded = pdf_bytes.decode("utf-8")
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        raise ValueError(
+            f"PDF exceeds MAX_PDF_BYTES ({MAX_PDF_BYTES} bytes) for {paper_id}"
+        )
+    if not pdf_bytes.startswith(b"%PDF-"):
+        raise ValueError(f"Invalid PDF header for {paper_id}: expected %PDF- magic bytes")
+
+    decoded = pdf_bytes.decode("latin-1")
     blocks: list[LayoutBlock] = []
     for match in _PDF_BLOCK_PATTERN.finditer(decoded):
-        raw_text = (
+        raw_escaped = (
             match.group("text")
             .replace("\\(", "(")
             .replace("\\)", ")")
             .replace("\\\\", "\\")
         )
+        raw_text = raw_escaped.encode("latin-1").decode("utf-8", errors="replace")
         blocks.append(
             LayoutBlock(
                 page_number=int(match.group("page")),
@@ -236,6 +246,11 @@ def extract_paper_from_pdf_bytes(
             )
         )
     if not blocks:
+        if "/FlateDecode" in decoded:
+            raise ValueError(
+                f"Compressed /FlateDecode PDF streams without uncompressed text blocks "
+                f"are not supported for {paper_id}"
+            )
         raise ValueError(f"No layout blocks found in PDF stream for {paper_id}")
     return extract_paper_from_layout(paper_id=paper_id, blocks=blocks, page_width=page_width)
 
