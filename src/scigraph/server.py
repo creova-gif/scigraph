@@ -106,14 +106,15 @@ def load_token_policies(path: Path) -> tuple[TokenPolicy, ...]:
     raw_policies: object
     if isinstance(decoded, list):
         raw_policies = decoded
-    elif isinstance(decoded, dict) and isinstance(decoded.get("policies"), list):
-        raw_policies = decoded["policies"]
+    elif isinstance(decoded, dict):
+        raw_policies = decoded.get("policies")
     else:
+        raw_policies = None
+
+    if not isinstance(raw_policies, list):
         raise ValueError(
             f"Token policies JSON in {path} must be a list or an object with a 'policies' list"
         )
-
-    assert isinstance(raw_policies, list)
     policies: list[TokenPolicy] = []
     for item in raw_policies:
         try:
@@ -840,9 +841,15 @@ class SciGraphApp:
                 return _error_response(HTTPStatus.BAD_REQUEST, f"Paper validation error: {exc}")
 
         if persist:
-            assert self.workspace_manager is not None
-            assert self.org_id is not None
-            assert self.workspace_id is not None
+            if (
+                self.workspace_manager is None
+                or self.org_id is None
+                or self.workspace_id is None
+            ):
+                return _error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    "Cannot persist verification results without a configured workspace",
+                )
             with self._lock:
                 try:
                     updated_graph, verification_reports = self.workspace_manager.ingest_papers(
