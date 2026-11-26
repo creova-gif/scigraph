@@ -280,6 +280,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ws_audit.add_argument("--json", action="store_true", help="Emit audit events as JSON.")
 
+    ws_export = ws_sub.add_parser(
+        "export-bundle",
+        help="Export an atomic compliance bundle for a tenant workspace.",
+    )
+    ws_export.add_argument("--root", type=str, required=True, help="Workspace root directory.")
+    ws_export.add_argument("--org", type=str, required=True, help="Organization ID slug.")
+    ws_export.add_argument("--workspace", type=str, required=True, help="Workspace ID slug.")
+    ws_export.add_argument(
+        "--output",
+        type=str,
+        required=True,
+        help="Output directory for the compliance bundle.",
+    )
+    ws_export.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit ProvenanceManifest as JSON.",
+    )
+
     fetch_p = sub.add_parser("fetch", help="Fetch papers from external scientific APIs.")
     fetch_p.add_argument(
         "--source",
@@ -448,7 +467,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     diagram_p = sub.add_parser(
         "diagram",
-        help="Export a ClaimGraph as a Mermaid flowchart or Graphviz DOT digraph.",
+        help="Export a ClaimGraph as Mermaid, Graphviz DOT, or GraphML XML.",
     )
     diagram_p.add_argument(
         "--store",
@@ -458,7 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     diagram_p.add_argument(
         "--format",
-        choices=("mermaid", "dot"),
+        choices=("mermaid", "dot", "graphml"),
         required=True,
         help="Diagram output format.",
     )

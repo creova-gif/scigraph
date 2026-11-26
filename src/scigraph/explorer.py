@@ -25,6 +25,20 @@ _STYLESHEET = """
     margin: 0; font-family: system-ui, -apple-system, sans-serif;
     background: var(--bg); color: var(--text); line-height: 1.5;
   }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
+  .skip-link {
+    position: absolute; left: -9999px; top: auto; width: 1px; height: 1px;
+    overflow: hidden;
+  }
+  .skip-link:focus, .skip-link:focus-visible {
+    position: fixed; left: 16px; top: 16px; width: auto; height: auto;
+    overflow: visible; padding: 8px 14px; background: var(--accent);
+    color: #0b1120; font-weight: 700; border-radius: 6px; z-index: 1000;
+    text-decoration: none; outline: 2px solid #f8fafc; outline-offset: 2px;
+  }
   .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 16px 48px; }
   .mono {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -42,6 +56,17 @@ _STYLESHEET = """
   .kpi-val { font-size: 1.5rem; font-weight: 700; color: var(--accent); }
   .kpi-lbl { font-size: 0.82rem; color: var(--muted); }
   .filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .search-wrap { margin-bottom: 14px; }
+  #claim-search {
+    width: 100%; max-width: 520px; padding: 9px 12px; border-radius: 6px;
+    background: var(--surface); color: var(--text); border: 1px solid var(--border);
+    font-size: 0.9rem;
+  }
+  #claim-search::placeholder { color: var(--muted); }
+  #claim-search:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; border-color: var(--accent);
+  }
+  .filter-status { margin-bottom: 18px; }
   .filter-btn {
     background: var(--surface); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 0.82rem;
@@ -93,9 +118,14 @@ _STYLESHEET = """
     background: #06281e; border: 1px solid #065f46; font-size: 0.86rem;
   }
   .exp-box p { margin: 4px 0; }
+  .table-scroll {
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+    border: 1px solid var(--border); border-radius: 8px;
+  }
+  .table-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .edge-table {
-    width: 100%; border-collapse: collapse; font-size: 0.85rem;
-    background: var(--surface); border: 1px solid var(--border);
+    width: 100%; min-width: 640px; border-collapse: collapse; font-size: 0.85rem;
+    background: var(--surface);
   }
   .edge-table th, .edge-table td {
     padding: 8px 10px; border-bottom: 1px solid var(--border);
@@ -109,27 +139,69 @@ _STYLESHEET = """
 """
 
 _SCRIPT = """
+const filterState = { contra: 'ALL', edge: 'ALL', query: '' };
+
+function applyFilters() {
+  const q = filterState.query;
+  const contraEls = document.querySelectorAll('.contra-card');
+  let contraVisible = 0;
+  contraEls.forEach((el) => {
+    const kindMatch = filterState.contra === 'ALL' || el.dataset.kind === filterState.contra;
+    const textMatch = q === '' || (el.textContent || '').toLowerCase().includes(q);
+    const match = kindMatch && textMatch;
+    el.classList.toggle('hidden', !match);
+    if (match) contraVisible += 1;
+  });
+  const contraBanner = document.getElementById('contra-empty-filter');
+  if (contraBanner) {
+    contraBanner.classList.toggle('hidden', contraVisible > 0 || contraEls.length === 0);
+  }
+
+  const edgeEls = document.querySelectorAll('.edge-row');
+  let edgeVisible = 0;
+  edgeEls.forEach((el) => {
+    const relMatch = filterState.edge === 'ALL' || el.dataset.relation === filterState.edge;
+    const textMatch = q === '' || (el.textContent || '').toLowerCase().includes(q);
+    const match = relMatch && textMatch;
+    el.classList.toggle('hidden', !match);
+    if (match) edgeVisible += 1;
+  });
+  const edgeBanner = document.getElementById('edge-empty-filter');
+  if (edgeBanner) {
+    edgeBanner.classList.toggle('hidden', edgeVisible > 0 || edgeEls.length === 0);
+  }
+
+  const statusEl = document.getElementById('filter-status');
+  if (statusEl) {
+    statusEl.textContent =
+      'Showing ' + contraVisible + ' of ' + contraEls.length +
+      ' contradictions and ' + edgeVisible + ' of ' + edgeEls.length +
+      ' evidence edges.';
+  }
+}
+
 document.querySelectorAll('.filter-btn').forEach((btn) => {
   btn.addEventListener('click', () => {
     const group = btn.dataset.group;
-    const filter = btn.dataset.filter;
+    const filter = btn.dataset.filter || 'ALL';
     const groupBtns = '.filter-btn[data-group="' + group + '"]';
     document.querySelectorAll(groupBtns).forEach((b) => {
       b.setAttribute('aria-pressed', String(b === btn));
     });
-    const selector = group === 'contra' ? '.contra-card' : '.edge-row';
-    const attr = group === 'contra' ? 'kind' : 'relation';
-    let visible = 0;
-    document.querySelectorAll(selector).forEach((el) => {
-      const match = filter === 'ALL' || el.dataset[attr] === filter;
-      el.classList.toggle('hidden', !match);
-      if (match) visible += 1;
-    });
-    const banner = document.getElementById(group + '-empty-filter');
-    const total = document.querySelectorAll(selector).length;
-    if (banner) banner.classList.toggle('hidden', visible > 0 || total === 0);
+    if (group === 'contra' || group === 'edge') {
+      filterState[group] = filter;
+    }
+    applyFilters();
   });
 });
+
+const searchInput = document.getElementById('claim-search');
+if (searchInput) {
+  searchInput.addEventListener('input', () => {
+    filterState.query = searchInput.value.trim().toLowerCase();
+    applyFilters();
+  });
+}
 """
 
 
@@ -236,10 +308,11 @@ def render_claim_graph_html(
         )
 
     edge_section_body = (
+        '<div class="table-scroll" role="region" aria-label="Evidence edges" tabindex="0">'
         '<table class="edge-table"><thead><tr>'
         "<th>ID</th><th>Relation</th><th>Claims</th>"
         "<th>Intervention / Outcome</th><th>Rationale</th>"
-        f'</tr></thead><tbody>{"".join(edge_rows)}</tbody></table>'
+        f'</tr></thead><tbody>{"".join(edge_rows)}</tbody></table></div>'
         if edge_rows
         else '<div class="empty-state">No evidence edges in graph.</div>'
     )
@@ -266,7 +339,8 @@ def render_claim_graph_html(
         f"<style>{_STYLESHEET}</style>\n"
         "</head>\n"
         "<body>\n"
-        '<main class="wrap">\n'
+        '<a class="skip-link" href="#main-content">Skip to main content</a>\n'
+        '<main id="main-content" class="wrap">\n'
         "  <header>\n"
         "    <h1>SciGraph Claim-Graph &amp; Contradiction Studio</h1>\n"
         '    <p class="kpi-lbl">Deterministic verbatim-verified scientific claims, '
@@ -285,6 +359,16 @@ def render_claim_graph_html(
         '<div class="kpi-lbl">Proposed Experiments</div></div>\n'
         f"    {f1_kpi}\n"
         "  </section>\n"
+        '  <div class="search-wrap">\n'
+        '    <label for="claim-search" class="sr-only">Search claims and evidence</label>\n'
+        '    <input id="claim-search" type="search" '
+        'placeholder="Filter by intervention, condition, outcome, DOI..." '
+        'autocomplete="off">\n'
+        "  </div>\n"
+        '  <div id="filter-status" class="filter-status kpi-lbl" '
+        'aria-live="polite" aria-atomic="true">'
+        f"Showing {len(contradictions)} of {len(contradictions)} contradictions and "
+        f"{len(graph.edges)} of {len(graph.edges)} evidence edges.</div>\n"
         '  <section aria-label="Contradiction Studio">\n'
         "    <h2>Contradiction &amp; Experiment Studio</h2>\n"
         '    <div class="filters" role="group" aria-label="Filter contradictions">\n'

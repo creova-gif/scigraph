@@ -249,6 +249,52 @@ def test_workspace_init_ingest_audit_roundtrip(
     assert rc_audit_text == 0
     assert "[ingest]" in audit_text.out
 
+    bundle_dir = tmp_path / "bundle-out"
+    rc_export = main(
+        [
+            "workspace",
+            "export-bundle",
+            "--root",
+            str(root),
+            "--org",
+            "acme-bio",
+            "--workspace",
+            "trial-alpha",
+            "--output",
+            str(bundle_dir),
+            "--json",
+        ]
+    )
+    export_out = capsys.readouterr()
+    assert rc_export == 0
+    manifest_payload = json.loads(export_out.out)
+    assert manifest_payload["manifest_version"] == "1.0"
+    assert len(manifest_payload["paper_hashes"]) == 2
+    assert len(manifest_payload["claim_hashes"]) > 0
+    assert (bundle_dir / "graph.json").exists()
+    assert (bundle_dir / "provenance.json").exists()
+    assert (bundle_dir / "workspace.json").exists()
+    assert (bundle_dir / "audit.jsonl").exists()
+
+    bundle_text_dir = tmp_path / "bundle-out-text"
+    rc_export_text = main(
+        [
+            "workspace",
+            "export-bundle",
+            "--root",
+            str(root),
+            "--org",
+            "acme-bio",
+            "--workspace",
+            "trial-alpha",
+            "--output",
+            str(bundle_text_dir),
+        ]
+    )
+    export_text_out = capsys.readouterr()
+    assert rc_export_text == 0
+    assert "Exported workspace acme-bio/trial-alpha bundle to" in export_text_out.out
+
 
 def test_wave4_error_exit_code_2(
     tmp_path: Path,
@@ -309,6 +355,23 @@ def test_wave4_error_exit_code_2(
                 "missing-ws",
                 "--input",
                 str(tmp_path / "no-such-corpus.json"),
+            ]
+        )
+        == 2
+    )
+    assert (
+        main(
+            [
+                "workspace",
+                "export-bundle",
+                "--root",
+                str(root),
+                "--org",
+                "missing-org",
+                "--workspace",
+                "missing-ws",
+                "--output",
+                str(tmp_path / "missing-bundle"),
             ]
         )
         == 2

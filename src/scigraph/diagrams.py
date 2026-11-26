@@ -1,4 +1,5 @@
 import re
+import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 
 from graph.claim_graph import ClaimGraph
@@ -135,3 +136,106 @@ def export_graphviz_dot(
 
     lines.append("}")
     return "\n".join(lines) + "\n"
+
+
+_GRAPHML_NS = "http://graphml.graphdrawing.org/xmlns"
+_GRAPHML_NODE_KEYS: tuple[tuple[str, str], ...] = (
+    ("paper_id", "string"),
+    ("doi", "string"),
+    ("intervention", "string"),
+    ("condition", "string"),
+    ("outcome", "string"),
+    ("direction", "string"),
+    ("p_value", "double"),
+    ("sample_size", "int"),
+)
+_GRAPHML_EDGE_KEYS: tuple[tuple[str, str], ...] = (
+    ("relation", "string"),
+    ("rationale", "string"),
+)
+
+
+def _graphml_tag(name: str) -> str:
+    """Return a GraphML-namespaced ElementTree tag name."""
+    return f"{{{_GRAPHML_NS}}}{name}"
+
+
+def _add_graphml_data(parent: ET.Element, key: str, value: str) -> None:
+    """Append a GraphML <data key=...> element with text content."""
+    data_el = ET.SubElement(parent, _graphml_tag("data"), {"key": key})
+    data_el.text = value
+
+
+def export_graphml(graph: ClaimGraph) -> str:
+    """Export a ClaimGraph as standard GraphML XML for Cytoscape/Gephi/NetworkX."""
+    ET.register_namespace("", _GRAPHML_NS)
+    root = ET.Element(_graphml_tag("graphml"))
+
+    for attr_name, attr_type in _GRAPHML_NODE_KEYS:
+        ET.SubElement(
+            root,
+            _graphml_tag("key"),
+            {
+                "id": attr_name,
+                "for": "node",
+                "attr.name": attr_name,
+                "attr.type": attr_type,
+            },
+        )
+    for attr_name, attr_type in _GRAPHML_EDGE_KEYS:
+        ET.SubElement(
+            root,
+            _graphml_tag("key"),
+            {
+                "id": attr_name,
+                "for": "edge",
+                "attr.name": attr_name,
+                "attr.type": attr_type,
+            },
+        )
+
+    graph_el = ET.SubElement(
+        root,
+        _graphml_tag("graph"),
+        {"id": "scigraph", "edgedefault": "directed"},
+    )
+
+    for claim in sorted(graph.claims, key=lambda c: c.claim_id):
+        node_el = ET.SubElement(
+            graph_el,
+            _graphml_tag("node"),
+            {"id": claim.claim_id},
+        )
+        ct = claim.claim_tuple
+        node_attrs: tuple[tuple[str, str], ...] = (
+            ("paper_id", claim.paper_id),
+            ("doi", claim.doi),
+            ("intervention", ct.intervention),
+            ("condition", ct.condition),
+            ("outcome", ct.outcome),
+            ("direction", ct.direction.value),
+            ("p_value", str(claim.statistics.p_value)),
+            ("sample_size", str(claim.statistics.sample_size)),
+        )
+        for key, value in node_attrs:
+            _add_graphml_data(node_el, key, value)
+
+    for edge in sorted(
+        graph.edges,
+        key=lambda e: (e.edge_id, e.source_claim_id, e.target_claim_id),
+    ):
+        edge_el = ET.SubElement(
+            graph_el,
+            _graphml_tag("edge"),
+            {
+                "id": edge.edge_id,
+                "source": edge.source_claim_id,
+                "target": edge.target_claim_id,
+            },
+        )
+        _add_graphml_data(edge_el, "relation", edge.relation.value)
+        _add_graphml_data(edge_el, "rationale", edge.rationale)
+
+    ET.indent(root, space="  ")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode") + "\n"
+

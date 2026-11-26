@@ -89,6 +89,12 @@ def test_diagram_mermaid_and_dot_stdout_and_file(
     assert rc_dot_file == 0
     assert dot_file.read_text(encoding="utf-8") == out_dot.out
 
+    rc_graphml = main(["diagram", "--store", str(store_path), "--format", "graphml"])
+    out_graphml = capsys.readouterr()
+    assert rc_graphml == 0
+    assert "<graphml " in out_graphml.out
+    assert "<graph id=\"scigraph\"" in out_graphml.out
+
 
 def test_protocols_markdown_and_json_stdout_and_file(
     tmp_path: Path,

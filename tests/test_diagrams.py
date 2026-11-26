@@ -1,7 +1,10 @@
+import xml.etree.ElementTree as ET
+
 from graph.claim_graph import ClaimGraph
 from scigraph.diagrams import (
     _escape_label,
     _sanitize_id,
+    export_graphml,
     export_graphviz_dot,
     export_mermaid_flowchart,
 )
@@ -222,3 +225,114 @@ def test_export_special_characters_and_deterministic_ordering() -> None:
     assert 'label="paper-a: Paper \\"Alpha\\" &lt;1&gt;";' in d1
     assert 'label="paper-b: Paper \\"Beta\\" (v2)";' in d1
     assert "color=darkgreen" in d1
+
+
+_GRAPHML_NS = "{http://graphml.graphdrawing.org/xmlns}"
+
+
+def test_export_graphml_empty_graph() -> None:
+    empty = ClaimGraph()
+    xml_text = export_graphml(empty)
+    assert xml_text.startswith('<?xml version="1.0" encoding="UTF-8"?>\n')
+
+    root = ET.fromstring(xml_text)
+    assert root.tag == f"{_GRAPHML_NS}graphml"
+
+    keys = root.findall(f"{_GRAPHML_NS}key")
+    node_keys = {k.attrib["attr.name"] for k in keys if k.attrib["for"] == "node"}
+    edge_keys = {k.attrib["attr.name"] for k in keys if k.attrib["for"] == "edge"}
+    assert node_keys == {
+        "paper_id",
+        "doi",
+        "intervention",
+        "condition",
+        "outcome",
+        "direction",
+        "p_value",
+        "sample_size",
+    }
+    assert edge_keys == {"relation", "rationale"}
+
+    graph_el = root.find(f"{_GRAPHML_NS}graph")
+    assert graph_el is not None
+    assert graph_el.attrib["edgedefault"] == "directed"
+    assert graph_el.findall(f"{_GRAPHML_NS}node") == []
+    assert graph_el.findall(f"{_GRAPHML_NS}edge") == []
+
+
+def test_export_graphml_populated_and_escaping() -> None:
+    graph = ClaimGraph()
+    p_b, c_b = _make_paper_and_claim(
+        paper_id="paper-b",
+        claim_id='claim-b & "2"',
+        doi="10.1000/graphml.002",
+        intervention='Drug "X" & <Y>',
+        condition="cohort <B>",
+        outcome="Biomarker\nLevel",
+        direction=EffectDirection.INCREASES,
+        p_value=0.02,
+        p_value_raw="p = 0.02",
+        sample_size=250,
+        sample_size_raw="n = 250",
+    )
+    p_a, c_a = _make_paper_and_claim(
+        paper_id="paper-a",
+        claim_id="claim-a",
+        doi="10.1000/graphml.001",
+        intervention='Drug "X" & <Y>',
+        condition="cohort <A>",
+        outcome="Biomarker\nLevel",
+        direction=EffectDirection.DECREASES,
+        p_value=0.005,
+        p_value_raw="p = 0.005",
+        sample_size=120,
+        sample_size_raw="n = 120",
+    )
+    # Insert out of sorted order to verify deterministic sorting by ID.
+    graph.add_verified_claim(p_b, c_b)
+    graph.add_verified_claim(p_a, c_a)
+    graph.build_edges()
+
+    xml_text = export_graphml(graph)
+    assert xml_text.startswith('<?xml version="1.0" encoding="UTF-8"?>\n')
+
+    root = ET.fromstring(xml_text)
+    graph_el = root.find(f"{_GRAPHML_NS}graph")
+    assert graph_el is not None
+
+    nodes = graph_el.findall(f"{_GRAPHML_NS}node")
+    assert [n.attrib["id"] for n in nodes] == ["claim-a", 'claim-b & "2"']
+
+    node_a_data = {
+        d.attrib["key"]: d.text for d in nodes[0].findall(f"{_GRAPHML_NS}data")
+    }
+    assert node_a_data == {
+        "paper_id": "paper-a",
+        "doi": "10.1000/graphml.001",
+        "intervention": 'Drug "X" & <Y>',
+        "condition": "cohort <A>",
+        "outcome": "Biomarker\nLevel",
+        "direction": "decreases",
+        "p_value": "0.005",
+        "sample_size": "120",
+    }
+
+    node_b_data = {
+        d.attrib["key"]: d.text for d in nodes[1].findall(f"{_GRAPHML_NS}data")
+    }
+    assert node_b_data["sample_size"] == "250"
+    assert node_b_data["p_value"] == "0.02"
+
+    edges = graph_el.findall(f"{_GRAPHML_NS}edge")
+    assert len(edges) == 1
+    edge_el = edges[0]
+    assert edge_el.attrib["id"] == graph.edges[0].edge_id
+    assert edge_el.attrib["source"] == graph.edges[0].source_claim_id
+    assert edge_el.attrib["target"] == graph.edges[0].target_claim_id
+
+    edge_data = {
+        d.attrib["key"]: d.text for d in edge_el.findall(f"{_GRAPHML_NS}data")
+    }
+    assert edge_data["relation"] == "qualifies"
+    assert edge_data["rationale"] == graph.edges[0].rationale
+

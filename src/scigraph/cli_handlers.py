@@ -25,7 +25,7 @@ from ingest.extractor import (
 from ingest.verifier import verify_paper_claims
 from scigraph.alerts import build_alert_payload, dispatch_webhook_alert
 from scigraph.config import load_scigraph_config
-from scigraph.diagrams import export_graphviz_dot, export_mermaid_flowchart
+from scigraph.diagrams import export_graphml, export_graphviz_dot, export_mermaid_flowchart
 from scigraph.diff import diff_claim_graphs, export_bibtex, export_ris
 from scigraph.doctor import run_doctor
 from scigraph.explorer import render_claim_graph_html
@@ -629,6 +629,25 @@ def _cmd_workspace(args: argparse.Namespace) -> int:
                         f"papers={event.paper_count} claims={event.claim_count} {event.detail}\n"
                     )
             return 0
+
+        if action == "export-bundle":
+            output_dir = Path(str(args.output))
+            manifest = manager.export_workspace_bundle(
+                org_id=org_id,
+                workspace_id=workspace_id,
+                output_dir=output_dir,
+            )
+            if as_json:
+                sys.stdout.write(
+                    json.dumps(manifest.model_dump(mode="json"), sort_keys=True, indent=2) + "\n"
+                )
+            else:
+                sys.stdout.write(
+                    f"Exported workspace {org_id}/{workspace_id} bundle to {output_dir} "
+                    f"(papers={len(manifest.paper_hashes)} claims={len(manifest.claim_hashes)} "
+                    f"graph_sha256={manifest.graph_sha256})\n"
+                )
+            return 0
     except (ValueError, FileNotFoundError, OSError, sqlite3.Error) as exc:
         sys.stderr.write(f"Workspace command '{action}' failed: {exc}\n")
         return 2
@@ -845,6 +864,8 @@ def _cmd_diagram(store: str, fmt: str, output: str | None) -> int:
     contradictions = detect_contradictions(graph)
     if fmt == "mermaid":
         rendered = export_mermaid_flowchart(graph, contradictions)
+    elif fmt == "graphml":
+        rendered = export_graphml(graph)
     else:
         rendered = export_graphviz_dot(graph, contradictions)
     return _write_or_stdout(rendered, output)
