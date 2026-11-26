@@ -1,21 +1,26 @@
-import ipaddress
 import json
-import socket
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from http.client import HTTPMessage
-from typing import IO, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
 from scigraph.models import ContradictionPair
+from scigraph.net_guard import (
+    NoRedirectHandler,
+    assert_public_dns_resolution,
+    validate_public_https_url,
+)
 
 AlertSeverity = Literal["critical", "warning", "info"]
 AlertEventType = Literal["contradiction_detected", "verification_failed", "pipeline_passed"]
 WebhookSender = Callable[[str, bytes], int]
+
+_NoRedirectHandler = NoRedirectHandler
+_assert_public_dns_resolution = assert_public_dns_resolution
 
 
 class AlertPayload(BaseModel):
@@ -32,74 +37,9 @@ class AlertPayload(BaseModel):
     timestamp_utc: str
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """HTTP redirect handler that blocks all redirects to prevent SSRF bypasses."""
-
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: IO[bytes],
-        code: int,
-        msg: str,
-        headers: HTTPMessage,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        raise ValueError("HTTP redirects are blocked by SSRF policy")
-
-
-def _is_non_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    )
-
-
-def _assert_public_dns_resolution(hostname: str) -> None:
-    """Resolve hostname via DNS and verify every returned IP address is public."""
-    try:
-        addr_infos = socket.getaddrinfo(hostname, None)
-    except OSError as exc:
-        raise ValueError(f"DNS resolution failed for hostname {hostname!r}: {exc}") from exc
-
-    if not addr_infos:
-        raise ValueError(f"DNS resolution returned no addresses for hostname {hostname!r}")
-
-    for info in addr_infos:
-        raw_ip = str(info[4][0]).split("%", 1)[0]
-        ip = ipaddress.ip_address(raw_ip)
-        if _is_non_public_ip(ip):
-            raise ValueError(
-                f"Refusing hostname {hostname!r} resolving to non-public IP {raw_ip!r}"
-            )
-
-
 def _validate_https_webhook_url(url: str) -> str:
     """Validate that a webhook URL is a safe public HTTPS URL (SSRF guard)."""
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme.lower() != "https":
-        raise ValueError(f"Only https:// URLs are allowed, got scheme {parsed.scheme!r}")
-
-    hostname = parsed.hostname
-    if not hostname:
-        raise ValueError("URL must include a non-empty hostname")
-
-    normalized_host = hostname.lower().rstrip(".")
-    if normalized_host == "localhost" or normalized_host.endswith(".localhost"):
-        raise ValueError(f"Refusing localhost URL: {hostname!r}")
-
-    try:
-        ip = ipaddress.ip_address(hostname)
-    except ValueError:
-        ip = None
-
-    if ip is not None and _is_non_public_ip(ip):
-        raise ValueError(f"Refusing non-public IP literal in URL: {hostname!r}")
-
-    return url
+    return validate_public_https_url(url, label="webhook URL")
 
 
 def build_alert_payload(

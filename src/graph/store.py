@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
-import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 from graph.claim_graph import ClaimGraph
+from scigraph.io_utils import atomic_write_text
 from scigraph.models import EffectDirection, ScientificClaim
 
 _SCHEMA_SQL = """
@@ -41,27 +40,8 @@ CREATE TABLE IF NOT EXISTS edges (
 
 def save_graph_json(graph: ClaimGraph, path: Path) -> None:
     """Atomically write a ClaimGraph as deterministic, sorted JSON."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(graph.to_dict(), indent=2, sort_keys=True)
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            tmp_path = Path(handle.name)
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink()
-        raise
+    atomic_write_text(path, payload, prefix=f".{path.name}.", create_parents=True)
 
 
 def load_graph_json(path: Path) -> ClaimGraph:

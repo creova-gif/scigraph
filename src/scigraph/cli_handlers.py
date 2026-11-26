@@ -3,10 +3,8 @@
 import argparse
 import http.client
 import json
-import os
 import sqlite3
 import sys
-import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -32,6 +30,7 @@ from scigraph.diff import diff_claim_graphs, export_bibtex, export_ris
 from scigraph.doctor import run_doctor
 from scigraph.explorer import render_claim_graph_html
 from scigraph.exporters import export_json_bundle, export_sarif_v210, render_markdown_report
+from scigraph.io_utils import atomic_write_text
 from scigraph.models import (
     BenchmarkMetrics,
     ContradictionPair,
@@ -70,29 +69,8 @@ def _resolve_cli_attr[T](name: str, default: T) -> T:
 
 
 def _atomic_write_text(output_path: Path, content: str) -> None:
-    if output_path.exists() and output_path.is_dir():
-        raise IsADirectoryError(f"Output path is a directory: {output_path}")
-    if not output_path.parent.exists():
-        raise FileNotFoundError(f"Parent directory does not exist: {output_path.parent}")
-
-    tmp_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=output_path.parent,
-            delete=False,
-            prefix=".scigraph-",
-            suffix=".tmp",
-        ) as handle:
-            tmp_name = handle.name
-            handle.write(content)
-            handle.flush()
-        os.replace(tmp_name, output_path)
-    except OSError:
-        if tmp_name is not None and os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-        raise
+    """Atomically write UTF-8 text to ``output_path`` via shared helper."""
+    atomic_write_text(output_path, content)
 
 
 def _save_graph_to_store(graph: ClaimGraph, store_path: Path) -> None:

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Literal, assert_never
 
@@ -24,6 +22,7 @@ from scigraph.exporters import (
     export_sarif_v210,
     render_markdown_report,
 )
+from scigraph.io_utils import atomic_write_text
 from scigraph.models import PaperVerificationReport
 from solver.symbolic import detect_contradictions, propose_falsifiable_experiments
 
@@ -69,30 +68,6 @@ class PipelineSummary(BaseModel):
     outputs_written: tuple[str, ...]
     graph_sha256: str = Field(min_length=64, max_length=64)
     passed: bool
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Atomically write UTF-8 text to ``path`` via NamedTemporaryFile + os.replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            tmp_path = Path(handle.name)
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink()
-        raise
 
 
 def _compute_graph_sha256(graph: ClaimGraph) -> str:
@@ -178,7 +153,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineSummary:
                 content = export_ris(graph.papers)
             case _ as unreachable:
                 assert_never(unreachable)
-        _atomic_write_text(out_path, content)
+        atomic_write_text(
+            out_path,
+            content,
+            prefix=f".{out_path.name}.",
+            create_parents=True,
+        )
         outputs_written.append(str(out_path))
 
     summary_path = report_dir / "summary.json"
@@ -202,8 +182,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineSummary:
         graph_sha256=_compute_graph_sha256(graph),
         passed=passed,
     )
-    _atomic_write_text(
+    atomic_write_text(
         summary_path,
         json.dumps(summary.model_dump(mode="json"), sort_keys=True, indent=2) + "\n",
+        prefix=f".{summary_path.name}.",
+        create_parents=True,
     )
     return summary

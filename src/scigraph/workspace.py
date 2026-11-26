@@ -3,7 +3,6 @@ from __future__ import annotations
 import fcntl
 import os
 import re
-import tempfile
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -17,6 +16,7 @@ from graph.claim_graph import ClaimGraph
 from graph.store import GraphSQLiteStore
 from ingest.extractor import extract_claims_from_paper
 from ingest.verifier import verify_paper_claims
+from scigraph.io_utils import atomic_write_text
 from scigraph.models import Paper, PaperVerificationReport
 
 WorkspaceAction = Literal["ingest", "verify", "query", "export", "contradiction_scan"]
@@ -51,30 +51,6 @@ def _workspace_lock(ws_dir: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Atomically write UTF-8 text to disk via a temporary file and os.replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            tmp_path = Path(handle.name)
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink()
-        raise
 
 
 class WorkspaceConfig(BaseModel):
@@ -160,7 +136,12 @@ class WorkspaceManager:
             created_at_utc=datetime.now(UTC).isoformat(),
         )
         ws_dir.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(config_path, config.model_dump_json(indent=2) + "\n")
+        atomic_write_text(
+            config_path,
+            config.model_dump_json(indent=2) + "\n",
+            prefix=f".{config_path.name}.",
+            create_parents=True,
+        )
         GraphSQLiteStore(ws_dir / "graph.db")
         self.record_event(
             org_id=org_id,
