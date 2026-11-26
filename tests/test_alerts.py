@@ -1,9 +1,14 @@
+import io
 import json
+import socket
+import urllib.request
+from http.client import HTTPMessage
 
 import pytest
 
 from scigraph.alerts import (
     AlertPayload,
+    _NoRedirectHandler,
     build_alert_payload,
     dispatch_webhook_alert,
 )
@@ -161,3 +166,72 @@ def test_dispatch_webhook_alert_failure_500() -> None:
     assert ok is False
     assert status == 500
     assert "500" in message
+
+
+@pytest.mark.parametrize("resolved_ip", ["169.254.169.254", "127.0.0.1"])
+def test_dispatch_webhook_alert_blocks_private_dns_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_ip: str,
+) -> None:
+    payload = build_alert_payload(contradictions=[])
+
+    def fake_getaddrinfo(
+        host: str,
+        port: object,
+    ) -> list[tuple[socket.AddressFamily, socket.SocketKind, int, str, tuple[str, int]]]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (resolved_ip, 0))]
+
+    def fail_build_opener(*handlers: object) -> object:
+        raise AssertionError("build_opener should not be called when DNS resolves to unsafe IP")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(urllib.request, "build_opener", fail_build_opener)
+
+    with pytest.raises(ValueError, match="non-public IP"):
+        dispatch_webhook_alert("https://hooks.slack.com/services/T000/B000/XXXX", payload)
+
+
+def test_dispatch_webhook_alert_handles_dns_oserror_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = build_alert_payload(contradictions=[])
+
+    def failing_getaddrinfo(
+        host: str,
+        port: object,
+    ) -> list[tuple[socket.AddressFamily, socket.SocketKind, int, str, tuple[str, int]]]:
+        raise socket.gaierror("Name or service not known")
+
+    monkeypatch.setattr(socket, "getaddrinfo", failing_getaddrinfo)
+
+    with pytest.raises(ValueError, match="DNS resolution failed"):
+        dispatch_webhook_alert("https://hooks.slack.com/services/T000/B000/XXXX", payload)
+
+
+def test_dispatch_webhook_alert_skips_dns_when_sender_injected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = build_alert_payload(contradictions=[])
+
+    def fail_getaddrinfo(host: str, port: object) -> object:
+        raise AssertionError("getaddrinfo must not be called when custom sender is injected")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail_getaddrinfo)
+
+    ok, status, _ = dispatch_webhook_alert(
+        "https://hooks.slack.com/services/T000/B000/XXXX",
+        payload,
+        sender=lambda url, body: 204,
+    )
+    assert ok is True
+    assert status == 204
+
+
+def test_alerts_no_redirect_handler_blocks_302_redirects() -> None:
+    handler = _NoRedirectHandler()
+    req = urllib.request.Request("https://hooks.slack.com/services/T000/B000/XXXX", method="POST")
+    headers = HTTPMessage()
+    headers["Location"] = "https://169.254.169.254/latest/meta-data"
+
+    with pytest.raises(ValueError, match="HTTP redirects are blocked by SSRF policy"):
+        handler.http_error_302(req, io.BytesIO(b""), 302, "Found", headers)

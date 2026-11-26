@@ -33,12 +33,13 @@ def _write_json_corpus(tmp_path: Path, count: int = 2) -> Path:
 
 def _write_flate_pdf_corpus(tmp_path: Path) -> Path:
     blocks = OPEN_ACCESS_5_PDF_LAYOUTS["arxiv-2401.10101"]
-    lines = [
-        f"BT /F1 10 Tf {b.x0:.1f} {b.y0:.1f} {b.x1:.1f} {b.y1:.1f} "
-        f"{b.page_number} Tm "
-        f"({b.text.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')}) Tj ET"
-        for b in blocks
-    ]
+    lines: list[str] = []
+    for b in blocks:
+        escaped = b.text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        lines.append(
+            f"BT /F1 10 Tf {b.x0:.1f} {b.y0:.1f} {b.x1:.1f} {b.y1:.1f} "
+            f"{b.page_number} Tm ({escaped}) Tj ET"
+        )
     pdf_path = tmp_path / "arxiv-2401.10101.pdf"
     pdf_path.write_bytes(_build_flate_pdf("\n".join(lines).encode("utf-8")))
     return pdf_path

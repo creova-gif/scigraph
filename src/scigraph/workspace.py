@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import tempfile
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -37,6 +39,18 @@ def _validate_slug(value: str, field_name: str) -> str:
             "and must not contain '..', '/', '\\\\', or whitespace"
         )
     return value
+
+
+@contextmanager
+def _workspace_lock(ws_dir: Path) -> Iterator[None]:
+    """Acquire an exclusive advisory file lock for a workspace directory."""
+    lock_path = ws_dir / ".workspace.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -208,41 +222,44 @@ class WorkspaceManager:
         """Extract, verify, and persist papers and claims into the workspace graph."""
         self.get_workspace(org_id, workspace_id)
         ws_dir = self._resolve_workspace_dir(org_id, workspace_id)
-        store = GraphSQLiteStore(ws_dir / "graph.db")
-        graph = store.load_graph()
 
-        reports: list[PaperVerificationReport] = []
-        verified_count = 0
-        rejected_count = 0
+        with _workspace_lock(ws_dir):
+            store = GraphSQLiteStore(ws_dir / "graph.db")
+            graph = store.load_graph()
 
-        for paper in papers:
-            extracted = extract_claims_from_paper(paper)
-            report = verify_paper_claims(paper, extracted)
-            reports.append(report)
-            graph.add_paper(paper)
-            for claim in report.verified_claims:
-                graph.add_verified_claim(paper, claim)
-            verified_count += len(report.verified_claims)
-            rejected_count += len(report.rejected_claim_ids)
+            reports: list[PaperVerificationReport] = []
+            verified_count = 0
+            rejected_count = 0
 
-        graph.build_edges()
-        store.save_graph(graph)
+            for paper in papers:
+                extracted = extract_claims_from_paper(paper)
+                report = verify_paper_claims(paper, extracted)
+                reports.append(report)
+                if report.doi_verified:
+                    graph.add_paper(paper)
+                    for claim in report.verified_claims:
+                        graph.add_verified_claim(paper, claim)
+                verified_count += len(report.verified_claims)
+                rejected_count += len(report.rejected_claim_ids)
 
-        status: AuditStatus = (
-            "rejected" if (rejected_count > 0 and verified_count == 0) else "ok"
-        )
-        self.record_event(
-            org_id=org_id,
-            workspace_id=workspace_id,
-            action="ingest",
-            paper_count=len(papers),
-            claim_count=verified_count,
-            status=status,
-            detail=(
-                f"Ingested {len(papers)} paper(s): "
-                f"{verified_count} verified claim(s), {rejected_count} rejected claim(s)"
-            ),
-        )
+            graph.build_edges()
+            store.save_graph(graph)
+
+            status: AuditStatus = (
+                "rejected" if (rejected_count > 0 and verified_count == 0) else "ok"
+            )
+            self.record_event(
+                org_id=org_id,
+                workspace_id=workspace_id,
+                action="ingest",
+                paper_count=len(papers),
+                claim_count=verified_count,
+                status=status,
+                detail=(
+                    f"Ingested {len(papers)} paper(s): "
+                    f"{verified_count} verified claim(s), {rejected_count} rejected claim(s)"
+                ),
+            )
         return graph, reports
 
     def load_graph(self, org_id: str, workspace_id: str) -> ClaimGraph:

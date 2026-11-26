@@ -255,3 +255,40 @@ def test_audit_jsonl_logging_and_rejected_ingest(tmp_path: Path) -> None:
         parsed = AuditEvent.model_validate_json(line)
         assert parsed.org_id == "org-audit"
         assert parsed.workspace_id == "ws-audit"
+
+
+def test_unverified_doi_paper_gated_out_of_graph_papers(tmp_path: Path) -> None:
+    manager = WorkspaceManager(tmp_path)
+    manager.init_workspace("org-gate", "ws-gate", "DOI Gate Workspace")
+
+    unverified_paper = _make_paper(
+        paper_id="p-unverified",
+        doi="10.9999/unverified.001",
+        sentence=(
+            "Treatment with Aspirin under baseline decreased platelet aggregation "
+            "compared with control (n = 50, p < 0.05)."
+        ),
+        include_doi_in_text=False,
+    )
+    verified_paper = _make_paper(
+        paper_id="p-verified",
+        doi="10.9999/verified.001",
+        sentence=(
+            "Treatment with Metformin under normoxia decreased blood glucose "
+            "compared with placebo (mean diff -1.4 mmol/L; n = 120, p < 0.001)."
+        ),
+        include_doi_in_text=True,
+    )
+
+    graph, reports = manager.ingest_papers(
+        "org-gate",
+        "ws-gate",
+        [unverified_paper, verified_paper],
+    )
+    assert [r.doi_verified for r in reports] == [False, True]
+    assert [p.paper_id for p in graph.papers] == ["p-verified"]
+    assert len(graph.claims) == 1
+
+    reloaded = manager.load_graph("org-gate", "ws-gate")
+    assert [p.paper_id for p in reloaded.papers] == ["p-verified"]
+    assert (tmp_path / "org-gate" / "ws-gate" / ".workspace.lock").is_file()

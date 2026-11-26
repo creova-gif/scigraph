@@ -177,6 +177,23 @@ class ClaimGraph:
         for raw_edge in raw_edges:
             edge = EvidenceEdge.model_validate(raw_edge, strict=False)
             graph._edges[edge.edge_id] = edge
+
+        for claim in graph._claims.values():
+            if claim.paper_id not in graph._papers:
+                raise ValueError(
+                    f"Claim '{claim.claim_id}' references unknown paper_id '{claim.paper_id}'"
+                )
+        for edge in graph._edges.values():
+            if edge.source_claim_id not in graph._claims:
+                raise ValueError(
+                    f"Edge '{edge.edge_id}' references unknown "
+                    f"source_claim_id '{edge.source_claim_id}'"
+                )
+            if edge.target_claim_id not in graph._claims:
+                raise ValueError(
+                    f"Edge '{edge.edge_id}' references unknown "
+                    f"target_claim_id '{edge.target_claim_id}'"
+                )
         return graph
 
     def edges_for_claim(self, claim_id: str) -> tuple[EvidenceEdge, ...]:

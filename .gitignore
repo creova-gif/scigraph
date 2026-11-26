@@ -18,3 +18,4 @@ coverage.xml
 *.db
 *.sqlite
 *.sqlite3
+uv.lock

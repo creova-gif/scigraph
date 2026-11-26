@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from graph import ClaimGraph, GraphSQLiteStore, load_graph_json, save_graph_json
+from ingest.verifier import verify_claim_verbatim
 from scigraph.models import (
     ClaimTuple,
     ComparisonOperator,
@@ -18,6 +19,7 @@ from scigraph.models import (
     ScientificClaim,
     SectionKind,
     StatisticalEvidence,
+    VerificationFailureReason,
 )
 
 
@@ -260,3 +262,43 @@ def test_sqlite_store_round_trip_and_schema(tmp_path: Path) -> None:
     assert replaced.papers == ()
     assert replaced.claims == ()
     assert replaced.edges == ()
+
+
+def test_verify_claim_verbatim_rejects_mismatched_paper_id() -> None:
+    paper, claim = _make_paper_and_claim(
+        paper_id="paper-001",
+        doi="10.1038/scigraph.2025.001",
+        claim_id="claim-001",
+        intervention="Metformin",
+        condition="Normoglycemic Adults",
+        outcome="Hepatic Gluconeogenesis",
+        direction=EffectDirection.DECREASES,
+    )
+    spoofed_claim = claim.model_copy(update={"paper_id": "paper-999"})
+
+    result = verify_claim_verbatim(paper, spoofed_claim)
+    assert result.verified is False
+    assert VerificationFailureReason.SPAN_OUT_OF_BOUNDS in result.failures
+
+
+def test_claim_graph_from_dict_rejects_orphan_claims_and_dangling_edges() -> None:
+    graph = _build_sample_graph()
+    base_payload = graph.to_dict()
+
+    # Orphan claim: claim.paper_id missing from papers
+    orphan_payload = json.loads(json.dumps(base_payload))
+    orphan_payload["claims"][0]["paper_id"] = "paper-missing"
+    with pytest.raises(ValueError, match="unknown paper_id 'paper-missing'"):
+        ClaimGraph.from_dict(orphan_payload)
+
+    # Dangling edge: source_claim_id missing from claims
+    dangling_source_payload = json.loads(json.dumps(base_payload))
+    dangling_source_payload["edges"][0]["source_claim_id"] = "claim-missing-src"
+    with pytest.raises(ValueError, match="unknown source_claim_id 'claim-missing-src'"):
+        ClaimGraph.from_dict(dangling_source_payload)
+
+    # Dangling edge: target_claim_id missing from claims
+    dangling_target_payload = json.loads(json.dumps(base_payload))
+    dangling_target_payload["edges"][0]["target_claim_id"] = "claim-missing-tgt"
+    with pytest.raises(ValueError, match="unknown target_claim_id 'claim-missing-tgt'"):
+        ClaimGraph.from_dict(dangling_target_payload)

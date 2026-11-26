@@ -263,17 +263,27 @@ def _extract_stream_filters(dict_bytes: bytes) -> list[bytes]:
     return []
 
 
-def _decompress_flate(data: bytes, label: str = "PDF") -> bytes:
+def _decompress_flate(
+    raw_data: bytes,
+    *,
+    label: str,
+    max_bytes: int = MAX_DECOMPRESSED_BYTES,
+) -> bytes:
+    if max_bytes < 0:
+        raise ValueError(
+            f"/FlateDecode stream exceeds MAX_DECOMPRESSED_BYTES "
+            f"({MAX_DECOMPRESSED_BYTES} bytes) for {label}"
+        )
     decompressor = zlib.decompressobj()
     try:
-        out = decompressor.decompress(data, MAX_DECOMPRESSED_BYTES + 1)
-        if len(out) > MAX_DECOMPRESSED_BYTES or decompressor.unconsumed_tail:
+        out = decompressor.decompress(raw_data, max_bytes + 1)
+        if len(out) > max_bytes or decompressor.unconsumed_tail:
             raise ValueError(
                 f"/FlateDecode stream exceeds MAX_DECOMPRESSED_BYTES "
                 f"({MAX_DECOMPRESSED_BYTES} bytes) for {label}"
             )
         tail = decompressor.flush()
-        if len(out) + len(tail) > MAX_DECOMPRESSED_BYTES:
+        if len(out) + len(tail) > max_bytes:
             raise ValueError(
                 f"/FlateDecode stream exceeds MAX_DECOMPRESSED_BYTES "
                 f"({MAX_DECOMPRESSED_BYTES} bytes) for {label}"
@@ -287,6 +297,7 @@ def _decompress_flate(data: bytes, label: str = "PDF") -> bytes:
 
 def _decode_pdf_streams(pdf_bytes: bytes, label: str = "PDF") -> list[str]:
     decoded_streams: list[str] = []
+    remaining_budget = MAX_DECOMPRESSED_BYTES
     for match in _STREAM_PATTERN.finditer(pdf_bytes):
         prefix_start = max(
             pdf_bytes.rfind(b"endobj", 0, match.start()),
@@ -300,7 +311,12 @@ def _decode_pdf_streams(pdf_bytes: bytes, label: str = "PDF") -> list[str]:
             filters = _extract_stream_filters(dict_match.group("dict"))
             if filters:
                 if filters == [b"FlateDecode"]:
-                    raw_data = _decompress_flate(raw_data, label=label)
+                    raw_data = _decompress_flate(
+                        raw_data,
+                        label=label,
+                        max_bytes=remaining_budget,
+                    )
+                    remaining_budget -= len(raw_data)
                 else:
                     names = ", ".join(f.decode("latin-1") for f in filters)
                     raise ValueError(

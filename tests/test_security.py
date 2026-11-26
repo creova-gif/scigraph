@@ -225,6 +225,9 @@ def test_rate_limiter_parameter_validation() -> None:
     with pytest.raises(ValueError):
         SlidingWindowRateLimiter(max_requests=5, window_seconds=math.inf)
 
+    with pytest.raises(ValueError):
+        SlidingWindowRateLimiter(max_requests=5, window_seconds=10.0, max_clients=0)
+
 
 def test_rate_limiter_sliding_window_and_retry_after() -> None:
     clock = FakeClock(initial=100.0)
@@ -259,3 +262,51 @@ def test_rate_limiter_sliding_window_and_retry_after() -> None:
     clock.advance(10.0)
     assert limiter.check("client-a") == (True, 0.0)
     assert limiter.check("client-a") == (True, 0.0)
+
+
+def test_rate_limiter_sweeps_expired_buckets_at_cap() -> None:
+    clock = FakeClock(initial=100.0)
+    limiter = SlidingWindowRateLimiter(
+        max_requests=1,
+        window_seconds=10.0,
+        clock=clock,
+        max_clients=3,
+    )
+
+    assert limiter.check("c1") == (True, 0.0)
+    assert limiter.check("c2") == (True, 0.0)
+    assert limiter.check("c3") == (True, 0.0)
+    assert len(limiter._windows) == 3
+
+    # Advance past window so c1, c2, c3 are all expired
+    clock.advance(11.0)
+    assert limiter.check("c4") == (True, 0.0)
+    assert list(limiter._windows.keys()) == ["c4"]
+
+
+def test_rate_limiter_evicts_oldest_when_still_at_cap() -> None:
+    clock = FakeClock(initial=100.0)
+    limiter = SlidingWindowRateLimiter(
+        max_requests=1,
+        window_seconds=10.0,
+        clock=clock,
+        max_clients=3,
+    )
+
+    assert limiter.check("c1") == (True, 0.0)
+    clock.advance(1.0)
+    assert limiter.check("c2") == (True, 0.0)
+    clock.advance(1.0)
+    assert limiter.check("c3") == (True, 0.0)
+    assert len(limiter._windows) == 3
+
+    # No buckets are expired at t=102.0; inserting c4 must evict oldest (c1)
+    assert limiter.check("c4") == (True, 0.0)
+    assert len(limiter._windows) == 3
+    assert "c1" not in limiter._windows
+    assert set(limiter._windows.keys()) == {"c2", "c3", "c4"}
+
+    # Existing active clients remain throttled within their window
+    allowed, retry_after = limiter.check("c2")
+    assert allowed is False
+    assert retry_after > 0.0

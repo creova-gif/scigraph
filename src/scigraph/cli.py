@@ -1,4 +1,5 @@
 import argparse
+import http.client
 import json
 import os
 import sqlite3
@@ -728,7 +729,7 @@ def _cmd_alert(store: str, webhook_url: str | None, as_json: bool) -> int:
         except ValueError as exc:
             sys.stderr.write(f"Alert webhook rejected: {exc}\n")
             return 2
-        except OSError as exc:
+        except (OSError, http.client.HTTPException) as exc:
             sys.stderr.write(f"Alert webhook failed: {exc}\n")
             return 2
 

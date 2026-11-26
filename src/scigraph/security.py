@@ -95,15 +95,15 @@ class AuthGate:
                 reason="malformed Authorization header; expected Bearer token",
             )
 
-        raw_token = parts[1].strip()
-        if not raw_token or any(ch.isspace() for ch in raw_token):
+        bearer_value = parts[1].strip()
+        if not bearer_value or any(ch.isspace() for ch in bearer_value):
             return AuthDecision(
                 allowed=False,
                 status_code=401,
                 reason="malformed Bearer token",
             )
 
-        candidate_digest = hash_bearer_token(raw_token)
+        candidate_digest = hash_bearer_token(bearer_value)
         matched_policy: TokenPolicy | None = None
         for policy in self._policies:
             if hmac.compare_digest(candidate_digest, policy.token_sha256):
@@ -145,17 +145,37 @@ class SlidingWindowRateLimiter:
         max_requests: int,
         window_seconds: float,
         clock: Callable[[], float] | None = None,
+        max_clients: int = 10_000,
     ) -> None:
         if max_requests < 1:
             raise ValueError("max_requests must be >= 1")
         if not math.isfinite(window_seconds) or window_seconds <= 0:
             raise ValueError("window_seconds must be a finite number > 0")
+        if max_clients < 1:
+            raise ValueError("max_clients must be >= 1")
 
         self._max_requests = max_requests
         self._window_seconds = float(window_seconds)
         self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
+        self._max_clients = max_clients
         self._lock = threading.Lock()
         self._windows: dict[str, deque[float]] = {}
+
+    def _prune_windows_locked(self, cutoff: float) -> None:
+        """Sweep expired buckets and evict oldest entries if still at capacity."""
+        expired_keys: list[str] = []
+        for key, win in self._windows.items():
+            while win and win[0] <= cutoff:
+                win.popleft()
+            if not win:
+                expired_keys.append(key)
+
+        for key in expired_keys:
+            del self._windows[key]
+
+        while len(self._windows) >= self._max_clients:
+            oldest_key = next(iter(self._windows))
+            del self._windows[oldest_key]
 
     def check(self, client_key: str) -> tuple[bool, float]:
         """Record a request if under limit, or return (False, retry_after_seconds)."""
@@ -164,6 +184,8 @@ class SlidingWindowRateLimiter:
             cutoff = now - self._window_seconds
             bucket = self._windows.get(client_key)
             if bucket is None:
+                if len(self._windows) >= self._max_clients:
+                    self._prune_windows_locked(cutoff)
                 bucket = deque()
                 self._windows[client_key] = bucket
 

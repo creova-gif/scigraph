@@ -1,4 +1,8 @@
+import io
 import json
+import socket
+import urllib.request
+from http.client import HTTPMessage
 from types import TracebackType
 from typing import Self
 
@@ -12,6 +16,7 @@ from ingest import (
 )
 from ingest.connectors import (
     MAX_RESPONSE_BYTES,
+    _NoRedirectHandler,
     _validate_https_url,
     default_https_fetcher,
 )
@@ -237,28 +242,103 @@ def test_validate_https_url_accepts_public_https() -> None:
     assert _validate_https_url(url) == url
 
 
+type _AddrInfoList = list[
+    tuple[socket.AddressFamily, socket.SocketKind, int, str, tuple[str, int]]
+]
+
+
+class _FakeOpener:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def open(
+        self,
+        fullurl: str | urllib.request.Request,
+        timeout: float = 15.0,
+    ) -> _FakeHttpResponse:
+        return _FakeHttpResponse(self._payload)
+
+
+def _fake_addrinfo(ip: str) -> _AddrInfoList:
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+
 def test_default_https_fetcher_enforces_max_response_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     oversized = b"x" * (MAX_RESPONSE_BYTES + 1)
+    handlers_used: list[object] = []
 
-    def fake_urlopen(url: str, timeout: float = 15.0) -> _FakeHttpResponse:
-        return _FakeHttpResponse(oversized)
+    def fake_getaddrinfo(host: str, port: object) -> _AddrInfoList:
+        return _fake_addrinfo("93.184.216.34")
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    def fake_build_opener(*handlers: object) -> _FakeOpener:
+        handlers_used.extend(handlers)
+        return _FakeOpener(oversized)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(urllib.request, "build_opener", fake_build_opener)
 
     with pytest.raises(ValueError, match="exceeded maximum size"):
         default_https_fetcher("https://export.arxiv.org/api/query")
+    assert _NoRedirectHandler in handlers_used
 
 
 def test_default_https_fetcher_returns_bounded_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     expected = b"<feed/>"
+    handlers_used: list[object] = []
 
-    def fake_urlopen(url: str, timeout: float = 15.0) -> _FakeHttpResponse:
-        return _FakeHttpResponse(expected)
+    def fake_getaddrinfo(host: str, port: object) -> _AddrInfoList:
+        return _fake_addrinfo("93.184.216.34")
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    def fake_build_opener(*handlers: object) -> _FakeOpener:
+        handlers_used.extend(handlers)
+        return _FakeOpener(expected)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(urllib.request, "build_opener", fake_build_opener)
 
     assert default_https_fetcher("https://export.arxiv.org/api/query") == expected
+    assert _NoRedirectHandler in handlers_used
+
+
+@pytest.mark.parametrize("resolved_ip", ["169.254.169.254", "127.0.0.1"])
+def test_default_https_fetcher_blocks_private_dns_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_ip: str,
+) -> None:
+    def fake_getaddrinfo(host: str, port: object) -> _AddrInfoList:
+        return _fake_addrinfo(resolved_ip)
+
+    def fail_build_opener(*handlers: object) -> _FakeOpener:
+        raise AssertionError("build_opener should not be called when DNS resolves to unsafe IP")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(urllib.request, "build_opener", fail_build_opener)
+
+    with pytest.raises(ValueError, match="non-public IP"):
+        default_https_fetcher("https://public.example.org/api/query")
+
+
+def test_default_https_fetcher_handles_dns_oserror_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_getaddrinfo(host: str, port: object) -> _AddrInfoList:
+        raise socket.gaierror("Name or service not known")
+
+    monkeypatch.setattr(socket, "getaddrinfo", failing_getaddrinfo)
+
+    with pytest.raises(ValueError, match="DNS resolution failed"):
+        default_https_fetcher("https://nonexistent.example.org/api/query")
+
+
+def test_no_redirect_handler_blocks_302_redirects() -> None:
+    handler = _NoRedirectHandler()
+    req = urllib.request.Request("https://export.arxiv.org/api/query")
+    headers = HTTPMessage()
+    headers["Location"] = "https://127.0.0.1/admin"
+
+    with pytest.raises(ValueError, match="HTTP redirects are blocked by SSRF policy"):
+        handler.http_error_302(req, io.BytesIO(b""), 302, "Found", headers)

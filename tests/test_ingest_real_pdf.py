@@ -41,12 +41,13 @@ def test_extract_text_flatedecode_and_tj_operators() -> None:
 
 def test_extract_paper_from_flatedecode_layout_pdf() -> None:
     blocks = OPEN_ACCESS_5_PDF_LAYOUTS["arxiv-2401.10101"]
-    lines = [
-        f"BT /F1 10 Tf {b.x0:.1f} {b.y0:.1f} {b.x1:.1f} {b.y1:.1f} "
-        f"{b.page_number} Tm "
-        f"({b.text.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')}) Tj ET"
-        for b in blocks
-    ]
+    lines: list[str] = []
+    for b in blocks:
+        escaped = b.text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        lines.append(
+            f"BT /F1 10 Tf {b.x0:.1f} {b.y0:.1f} {b.x1:.1f} {b.y1:.1f} "
+            f"{b.page_number} Tm ({escaped}) Tj ET"
+        )
     pdf_bytes = _build_flate_pdf("\n".join(lines).encode("utf-8"))
 
     paper = extract_paper_from_pdf_bytes("arxiv-2401.10101", pdf_bytes)
@@ -68,6 +69,29 @@ def test_flatedecode_decompression_bomb_and_corrupt_zlib() -> None:
     )
     with pytest.raises(ValueError, match="/FlateDecode"):
         extract_text_from_pdf_bytes(corrupt_pdf)
+
+
+def test_flatedecode_cumulative_multistream_decompression_bomb() -> None:
+    chunk_size = 26 * 1024 * 1024
+    assert chunk_size < MAX_DECOMPRESSED_BYTES
+    assert chunk_size * 2 > MAX_DECOMPRESSED_BYTES
+
+    compressed_chunk = zlib.compress(b"A" * chunk_size)
+    multistream_pdf = (
+        b"%PDF-1.4\n"
+        b"1 0 obj << /Length "
+        + str(len(compressed_chunk)).encode("ascii")
+        + b" /Filter /FlateDecode >> stream\n"
+        + compressed_chunk
+        + b"\nendstream\nendobj\n"
+        b"2 0 obj << /Length "
+        + str(len(compressed_chunk)).encode("ascii")
+        + b" /Filter /FlateDecode >> stream\n"
+        + compressed_chunk
+        + b"\nendstream\nendobj\n%%EOF\n"
+    )
+    with pytest.raises(ValueError, match="MAX_DECOMPRESSED_BYTES"):
+        extract_text_from_pdf_bytes(multistream_pdf)
 
 
 def test_pdf_error_guards_header_size_encrypt_filter_empty() -> None:
