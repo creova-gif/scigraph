@@ -248,14 +248,26 @@ def test_cli_serve_loads_scigraph_toml_defaults_and_allows_cli_overrides(
     assert app_default.rate_limiter._window_seconds == 15.0
     assert app_default.workspace_manager is not None
     assert app_default.workspace_manager.root_dir == ws_default
-    assert len(app_default.graph.claims) > 0
+    assert len(app_default.graph.claims) == 0
+
+    captured.clear()
+    rc_both = main(
+        [
+            "serve",
+            "--store",
+            str(override_store),
+            "--workspace-root",
+            str(ws_override),
+        ]
+    )
+    err_both = capsys.readouterr()
+    assert rc_both == 2
+    assert "cannot be used together" in err_both.err
 
     captured.clear()
     rc_override = main(
         [
             "serve",
-            "--store",
-            str(override_store),
             "--workspace-root",
             str(ws_override),
             "--org",
@@ -275,3 +287,94 @@ def test_cli_serve_loads_scigraph_toml_defaults_and_allows_cli_overrides(
     assert app_override.rate_limiter._window_seconds == 10.0
     assert app_override.workspace_manager is not None
     assert app_override.workspace_manager.root_dir == ws_override
+
+
+def test_cli_serve_explicit_rate_window_60_overrides_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_file = tmp_path / "scigraph.toml"
+    cfg_file.write_text(
+        "[scigraph]\nrate_limit = 10\nrate_window_seconds = 30.0\n",
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    class _FakeServer:
+        def serve_forever(self) -> None:
+            captured["served"] = True
+
+        def server_close(self) -> None:
+            captured["closed"] = True
+
+    def _fake_create_http_server(
+        host: str,
+        port: int,
+        app: SciGraphApp,
+    ) -> _FakeServer:
+        captured["app"] = app
+        return _FakeServer()
+
+    monkeypatch.setattr("scigraph.cli.create_http_server", _fake_create_http_server)
+    monkeypatch.chdir(tmp_path)
+
+    rc = main(["serve", "--rate-window", "60"])
+    assert rc == 0
+    app = captured["app"]
+    assert isinstance(app, SciGraphApp)
+    assert app.rate_limiter is not None
+    assert app.rate_limiter._max_requests == 10
+    assert app.rate_limiter._window_seconds == 60.0
+
+
+def test_cli_serve_workspace_root_does_not_fallback_to_default_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    papers = [
+        extract_paper_from_layout(spec.paper_id, spec.blocks).model_dump(mode="json")
+        for spec in BENCHMARK_30_PAPERS[:1]
+    ]
+    corpus_path = tmp_path / "corpus.json"
+    corpus_path.write_text(json.dumps({"papers": papers}), encoding="utf-8")
+
+    default_store = tmp_path / "default.db"
+    assert main(["ingest", str(corpus_path), "--store", str(default_store)]) == 0
+    capsys.readouterr()
+
+    cfg_file = tmp_path / "scigraph.toml"
+    cfg_file.write_text(
+        f'[scigraph]\ndefault_store = "{default_store}"\n',
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    class _FakeServer:
+        def serve_forever(self) -> None:
+            captured["served"] = True
+
+        def server_close(self) -> None:
+            captured["closed"] = True
+
+    def _fake_create_http_server(
+        host: str,
+        port: int,
+        app: SciGraphApp,
+    ) -> _FakeServer:
+        captured["app"] = app
+        return _FakeServer()
+
+    monkeypatch.setattr("scigraph.cli.create_http_server", _fake_create_http_server)
+    monkeypatch.chdir(tmp_path)
+
+    ws_root = tmp_path / "ws-cli"
+    rc = main(["serve", "--workspace-root", str(ws_root)])
+    assert rc == 0
+    app = captured["app"]
+    assert isinstance(app, SciGraphApp)
+    assert app.workspace_manager is not None
+    assert app.workspace_manager.root_dir == ws_root
+    assert len(app.graph.claims) == 0

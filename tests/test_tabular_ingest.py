@@ -189,3 +189,77 @@ def test_parse_pubmed_efetch_xml_valid_and_fallback_doi_and_skips() -> None:
 def test_parse_pubmed_efetch_xml_malformed_raises() -> None:
     with pytest.raises(ValueError, match="Malformed PubMed EFetch XML"):
         parse_pubmed_efetch_xml(b"<PubmedArticleSet><unclosed></PubmedArticleSet>")
+
+
+def test_parse_pubmed_efetch_xml_ignores_cited_reference_doi() -> None:
+    xml_bytes = b"""<?xml version="1.0" encoding="UTF-8"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>39007777</PMID>
+      <Article>
+        <Journal>
+          <JournalIssue>
+            <PubDate><Year>2024</Year></PubDate>
+          </JournalIssue>
+          <Title>BMJ</Title>
+        </Journal>
+        <ArticleTitle>Article without own DOI but with cited reference DOI.</ArticleTitle>
+        <Abstract>
+          <AbstractText>Primary outcome remained unchanged (n=40, p=0.51).</AbstractText>
+        </Abstract>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="pubmed">39007777</ArticleId>
+      </ArticleIdList>
+      <ReferenceList>
+        <Reference>
+          <ArticleIdList>
+            <ArticleId IdType="doi">10.9999/cited</ArticleId>
+          </ArticleIdList>
+        </Reference>
+      </ReferenceList>
+    </PubmedData>
+  </PubmedArticle>
+</PubmedArticleSet>
+"""
+    papers = parse_pubmed_efetch_xml(xml_bytes)
+    assert len(papers) == 1
+    assert papers[0].paper_id == "pubmed-39007777"
+    assert papers[0].doi == "10.0000/pubmed.39007777"
+
+
+def test_parse_pubmed_efetch_xml_uses_elocation_doi_when_pubmed_data_lacks_doi() -> None:
+    xml_bytes = b"""<?xml version="1.0" encoding="UTF-8"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>39007778</PMID>
+      <Article>
+        <ArticleTitle>Article with ELocationID DOI.</ArticleTitle>
+        <ELocationID EIdType="doi" ValidYN="Y">10.1056/NEJMoa2400001</ELocationID>
+        <Abstract>
+          <AbstractText>Hazard ratio was 0.78 (p=0.002).</AbstractText>
+        </Abstract>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="pubmed">39007778</ArticleId>
+      </ArticleIdList>
+      <ReferenceList>
+        <Reference>
+          <ArticleIdList>
+            <ArticleId IdType="doi">10.9999/cited</ArticleId>
+          </ArticleIdList>
+        </Reference>
+      </ReferenceList>
+    </PubmedData>
+  </PubmedArticle>
+</PubmedArticleSet>
+"""
+    papers = parse_pubmed_efetch_xml(xml_bytes)
+    assert len(papers) == 1
+    assert papers[0].doi == "10.1056/NEJMoa2400001"

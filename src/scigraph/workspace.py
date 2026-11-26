@@ -204,24 +204,26 @@ class WorkspaceManager:
         self.get_workspace(org_id, workspace_id)
         ws_dir = self._resolve_workspace_dir(org_id, workspace_id)
 
+        verified_entries: list[tuple[Paper, PaperVerificationReport]] = []
+        reports: list[PaperVerificationReport] = []
+        verified_count = 0
+        rejected_count = 0
+
+        for paper in papers:
+            extracted = extract_claims_from_paper(paper)
+            report = verify_paper_claims(paper, extracted)
+            reports.append(report)
+            verified_entries.append((paper, report))
+            verified_count += len(report.verified_claims)
+            rejected_count += len(report.rejected_claim_ids)
+
         with _workspace_lock(ws_dir):
             store = GraphSQLiteStore(ws_dir / "graph.db")
             graph = store.load_graph()
 
-            reports: list[PaperVerificationReport] = []
-            verified_count = 0
-            rejected_count = 0
-
-            for paper in papers:
-                extracted = extract_claims_from_paper(paper)
-                report = verify_paper_claims(paper, extracted)
-                reports.append(report)
+            for paper, report in verified_entries:
                 if report.doi_verified:
-                    graph.add_paper(paper)
-                    for claim in report.verified_claims:
-                        graph.add_verified_claim(paper, claim)
-                verified_count += len(report.verified_claims)
-                rejected_count += len(report.rejected_claim_ids)
+                    graph.replace_paper_claims(paper, report.verified_claims)
 
             graph.build_edges()
             store.save_graph(graph)

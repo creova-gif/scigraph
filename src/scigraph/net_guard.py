@@ -33,7 +33,8 @@ def is_non_public_ip(ip_str: str) -> bool:
     clean_ip = ip_str.split("%", 1)[0]
     ip = ipaddress.ip_address(clean_ip)
     return (
-        ip.is_private
+        not ip.is_global
+        or ip.is_private
         or ip.is_loopback
         or ip.is_link_local
         or ip.is_reserved

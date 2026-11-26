@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
+import scigraph.workspace as workspace_module
+from ingest.extractor import extract_claims_from_paper
 from scigraph.cli import main
-from scigraph.models import EdgeRelation, Paper
+from scigraph.models import EdgeRelation, Paper, ScientificClaim
 from scigraph.workspace import AuditEvent, WorkspaceConfig, WorkspaceManager
 
 
@@ -392,3 +394,105 @@ def test_read_audit_log_filtering_and_limit(
     bad_captured = capsys.readouterr()
     assert rc_bad == 2
     assert "limit must be >= 1" in bad_captured.err
+
+
+def test_reimport_revised_paper_removes_obsolete_claims(tmp_path: Path) -> None:
+    manager = WorkspaceManager(tmp_path)
+    manager.init_workspace("org-rev", "ws-rev", "Revision Workspace")
+
+    paper_v1 = _make_paper(
+        paper_id="p-rev-001",
+        doi="10.5555/rev.001",
+        sentence=(
+            "Treatment with Metformin under normoxia decreased blood glucose "
+            "compared with placebo (mean diff -1.4 mmol/L; n = 120, p < 0.001).\n"
+            "Treatment with Metformin under hypoxia increased lactate "
+            "compared with placebo (mean diff +0.6 mmol/L; n = 120, p = 0.01)."
+        ),
+    )
+    graph_v1, reports_v1 = manager.ingest_papers("org-rev", "ws-rev", [paper_v1])
+    assert len(reports_v1[0].verified_claims) == 2
+    assert len(graph_v1.claims) == 2
+
+    paper_v2 = _make_paper(
+        paper_id="p-rev-001",
+        doi="10.5555/rev.001",
+        sentence=(
+            "Treatment with Metformin under normoxia decreased blood glucose "
+            "compared with placebo (mean diff -1.4 mmol/L; n = 120, p < 0.001)."
+        ),
+    )
+    graph_v2, reports_v2 = manager.ingest_papers("org-rev", "ws-rev", [paper_v2])
+    assert len(reports_v2[0].verified_claims) == 1
+    assert len(graph_v2.papers) == 1
+    assert [c.claim_tuple.outcome for c in graph_v2.claims] == ["blood glucose"]
+
+    reloaded_v2 = manager.load_graph("org-rev", "ws-rev")
+    assert [c.claim_tuple.outcome for c in reloaded_v2.claims] == ["blood glucose"]
+
+    paper_v3_zero_claims = _make_paper(
+        paper_id="p-rev-001",
+        doi="10.5555/rev.001",
+        sentence="No quantitative treatment effects were observed in this revision.",
+    )
+    graph_v3, reports_v3 = manager.ingest_papers(
+        "org-rev", "ws-rev", [paper_v3_zero_claims]
+    )
+    assert reports_v3[0].doi_verified is True
+    assert len(reports_v3[0].verified_claims) == 0
+    assert len(graph_v3.papers) == 1
+    assert len(graph_v3.claims) == 0
+
+    reloaded_v3 = manager.load_graph("org-rev", "ws-rev")
+    assert len(reloaded_v3.papers) == 1
+    assert len(reloaded_v3.claims) == 0
+
+
+def test_interleaved_ingest_papers_do_not_overwrite_each_other(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WorkspaceManager(tmp_path)
+    manager.init_workspace("org-interleave", "ws-interleave", "Interleave Workspace")
+
+    paper_first = _make_paper(
+        paper_id="p-first",
+        doi="10.5555/interleave.001",
+        sentence=(
+            "Treatment with Metformin under normoxia decreased blood glucose "
+            "compared with placebo (mean diff -1.2 mmol/L; n = 80, p < 0.01)."
+        ),
+    )
+    paper_second = _make_paper(
+        paper_id="p-second",
+        doi="10.5555/interleave.002",
+        sentence=(
+            "Treatment with Metformin under normoxia increased blood glucose "
+            "compared with placebo (mean diff +0.9 mmol/L; n = 64, p = 0.02)."
+        ),
+    )
+
+    interleaved_once = False
+
+    def interleaved_extract(paper: Paper) -> tuple[ScientificClaim, ...]:
+        nonlocal interleaved_once
+        if paper.paper_id == "p-first" and not interleaved_once:
+            interleaved_once = True
+            manager.ingest_papers("org-interleave", "ws-interleave", [paper_second])
+        return extract_claims_from_paper(paper)
+
+    monkeypatch.setattr(workspace_module, "extract_claims_from_paper", interleaved_extract)
+
+    graph_after_first, _ = manager.ingest_papers(
+        "org-interleave", "ws-interleave", [paper_first]
+    )
+    assert interleaved_once is True
+    assert sorted(p.paper_id for p in graph_after_first.papers) == ["p-first", "p-second"]
+    assert sorted(c.paper_id for c in graph_after_first.claims) == ["p-first", "p-second"]
+    assert len(graph_after_first.edges) == 1
+    assert graph_after_first.edges[0].relation == EdgeRelation.CONTRADICTS
+
+    reloaded = manager.load_graph("org-interleave", "ws-interleave")
+    assert sorted(p.paper_id for p in reloaded.papers) == ["p-first", "p-second"]
+    assert sorted(c.paper_id for c in reloaded.claims) == ["p-first", "p-second"]
+    assert len(reloaded.edges) == 1

@@ -165,8 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument(
         "--rate-window",
         type=float,
-        default=60.0,
-        help="Sliding rate-limit window duration in seconds (default: 60.0).",
+        default=None,
+        help="Sliding rate-limit window duration in seconds (default: config or 60.0).",
     )
     serve_p.add_argument(
         "--workspace-root",
@@ -559,7 +559,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             store=args.store,
             tokens=args.tokens,
             rate_limit=args.rate_limit,
-            rate_window=float(args.rate_window),
+            rate_window=float(args.rate_window) if args.rate_window is not None else None,
             workspace_root=args.workspace_root,
             org=args.org,
             workspace=args.workspace,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from itertools import combinations
 from typing import Any
 
@@ -50,6 +51,35 @@ class ClaimGraph:
         self._papers[paper.paper_id] = paper
         self._claims[claim.claim_id] = claim
         return result
+
+    def replace_paper_claims(
+        self,
+        paper: Paper,
+        claims: Sequence[ScientificClaim],
+    ) -> list[ClaimVerificationResult]:
+        """Validate all incoming claims, then atomically replace existing claims for paper."""
+        results: list[ClaimVerificationResult] = []
+        for claim in claims:
+            result = verify_claim_verbatim(paper, claim)
+            if not result.verified:
+                reasons = ", ".join(r.value for r in result.failures)
+                raise ValueError(
+                    f"Claim {claim.claim_id} failed verbatim verification: {reasons}"
+                )
+            results.append(result)
+
+        stale_ids = [
+            claim_id
+            for claim_id, existing in self._claims.items()
+            if existing.paper_id == paper.paper_id
+        ]
+        for claim_id in stale_ids:
+            del self._claims[claim_id]
+
+        self._papers[paper.paper_id] = paper
+        for claim in claims:
+            self._claims[claim.claim_id] = claim
+        return results
 
     def build_edges(self) -> tuple[EvidenceEdge, ...]:
         self._edges.clear()

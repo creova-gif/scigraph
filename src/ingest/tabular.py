@@ -148,6 +148,19 @@ def _element_text(element: ET.Element | None) -> str:
     return _normalize_whitespace("".join(element.itertext()))
 
 
+def _extract_pubmed_doi(article: ET.Element) -> str:
+    """Extract the article's own DOI without matching cited ReferenceList DOIs."""
+    for xpath in (
+        "./PubmedData/ArticleIdList/ArticleId[@IdType='doi']",
+        "./MedlineCitation/Article/ELocationID[@EIdType='doi'][@ValidYN='Y']",
+    ):
+        for id_node in article.findall(xpath):
+            candidate = _element_text(id_node)
+            if candidate and DOI_PATTERN.match(candidate):
+                return candidate
+    return ""
+
+
 def parse_pubmed_efetch_xml(xml_bytes: bytes) -> list[Paper]:
     """Parse PubMed EFetch ``<PubmedArticleSet>`` XML bytes into Paper models."""
     try:
@@ -170,13 +183,7 @@ def parse_pubmed_efetch_xml(xml_bytes: bytes) -> list[Paper]:
         if not pmid or not title or not abstract:
             continue
 
-        doi = ""
-        for id_node in article.findall(".//ArticleId"):
-            if id_node.attrib.get("IdType") == "doi":
-                candidate = _element_text(id_node)
-                if candidate and DOI_PATTERN.match(candidate):
-                    doi = candidate
-                    break
+        doi = _extract_pubmed_doi(article)
         if not doi:
             doi = f"10.0000/pubmed.{_sanitize_doi_suffix(pmid)}"
 

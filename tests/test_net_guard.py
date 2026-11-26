@@ -28,6 +28,7 @@ type _AddrInfoList = list[
         ("172.16.0.1", True),
         ("192.168.1.1", True),
         ("169.254.169.254", True),
+        ("100.64.0.1", True),
         ("0.0.0.0", True),
         ("224.0.0.1", True),
         ("240.0.0.1", True),
@@ -67,6 +68,7 @@ def test_is_non_public_ip_rejects_invalid_ip() -> None:
         "https://172.16.0.5/internal",
         "https://192.168.1.10/internal",
         "https://169.254.169.254/latest/meta-data",
+        "https://100.64.0.1/internal",
         "https://0.0.0.0/",
         "https://224.0.0.1/",
         "https://[::1]/api",
@@ -123,6 +125,7 @@ def test_assert_public_dns_resolution_accepts_public_ips(
     [
         ["127.0.0.1"],
         ["169.254.169.254"],
+        ["100.64.0.1"],
         ["10.0.0.1"],
         ["fe80::1%eth0"],
         ["93.184.216.34", "127.0.0.1"],

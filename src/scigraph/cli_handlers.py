@@ -192,8 +192,12 @@ def _cmd_verify(paper_id: str | None, input_path: str | None = None) -> int:
             return 2
         all_ok = True
         for paper in papers:
-            claims = extract_claims_from_paper(paper)
-            report = verify_paper_claims(paper, claims)
+            try:
+                claims = extract_claims_from_paper(paper)
+                report = verify_paper_claims(paper, claims)
+            except (ValueError, OSError) as exc:
+                sys.stderr.write(f"Failed to verify paper '{paper.paper_id}': {exc}\n")
+                return 2
             if not report.doi_verified or report.rejected_claim_ids:
                 all_ok = False
             sys.stdout.write(
@@ -211,13 +215,17 @@ def _cmd_verify(paper_id: str | None, input_path: str | None = None) -> int:
     target_specs = [specs_by_id[paper_id]] if paper_id is not None else list(BENCHMARK_30_PAPERS)
     all_ok = True
     for idx, spec in enumerate(target_specs):
-        if paper_id is None and idx < 5:
-            pdf_bytes = render_blocks_to_pdf_bytes(spec.blocks)
-            paper = extract_paper_from_pdf_bytes(spec.paper_id, pdf_bytes)
-        else:
-            paper = extract_paper_from_layout(spec.paper_id, spec.blocks)
-        claims = extract_claims_from_paper(paper)
-        report = verify_paper_claims(paper, claims)
+        try:
+            if paper_id is None and idx < 5:
+                pdf_bytes = render_blocks_to_pdf_bytes(spec.blocks)
+                paper = extract_paper_from_pdf_bytes(spec.paper_id, pdf_bytes)
+            else:
+                paper = extract_paper_from_layout(spec.paper_id, spec.blocks)
+            claims = extract_claims_from_paper(paper)
+            report = verify_paper_claims(paper, claims)
+        except (ValueError, OSError) as exc:
+            sys.stderr.write(f"Failed to verify paper '{spec.paper_id}': {exc}\n")
+            return 2
         if not report.doi_verified or report.rejected_claim_ids:
             all_ok = False
         sys.stdout.write(
@@ -360,7 +368,7 @@ def _cmd_query(
                 f"{claim.claim_id} [{claim.paper_id}]: "
                 f"{ct.intervention} ({ct.condition}) -> {ct.outcome} "
                 f"[{ct.direction.value}] (n={claim.statistics.sample_size}, "
-                f"p={claim.statistics.p_value:g})\n"
+                f"{claim.statistics.p_value_raw})\n"
             )
     return 0
 
@@ -371,19 +379,38 @@ def _cmd_serve(
     store: str | None,
     tokens: str | None = None,
     rate_limit: int | None = None,
-    rate_window: float = 60.0,
+    rate_window: float | None = None,
     workspace_root: str | None = None,
     org: str | None = None,
     workspace: str | None = None,
 ) -> int:
     try:
         cfg = load_scigraph_config()
-        resolved_store = store if store is not None else cfg.default_store
+        if store is not None and workspace_root is not None:
+            sys.stderr.write(
+                "Failed to start server: --store and --workspace-root cannot be used together.\n"
+            )
+            return 2
+
         resolved_workspace_root = (
-            workspace_root if workspace_root is not None else cfg.workspace_root
+            None
+            if store is not None
+            else (workspace_root if workspace_root is not None else cfg.workspace_root)
+        )
+        if (org is not None or workspace is not None) and resolved_workspace_root is None:
+            sys.stderr.write(
+                "Failed to start server: --org and --workspace require --workspace-root "
+                "(or workspace_root in config).\n"
+            )
+            return 2
+
+        resolved_store = (
+            store
+            if store is not None
+            else (None if resolved_workspace_root is not None else cfg.default_store)
         )
         resolved_rate_limit = rate_limit if rate_limit is not None else cfg.rate_limit
-        resolved_rate_window = cfg.rate_window_seconds if rate_window == 60.0 else rate_window
+        resolved_rate_window = cfg.rate_window_seconds if rate_window is None else rate_window
         resolved_org = org if org is not None else cfg.default_org
 
         if (
@@ -398,7 +425,16 @@ def _cmd_serve(
             )
             return 0
 
-        auth_gate = AuthGate(load_token_policies(Path(tokens))) if tokens is not None else None
+        auth_gate: AuthGate | None = None
+        if tokens is not None:
+            policies = load_token_policies(Path(tokens))
+            if not policies:
+                sys.stderr.write(
+                    f"Failed to start server: token policy file '{tokens}' "
+                    "contains no policies.\n"
+                )
+                return 2
+            auth_gate = AuthGate(policies)
         rate_limiter = (
             SlidingWindowRateLimiter(
                 max_requests=resolved_rate_limit,

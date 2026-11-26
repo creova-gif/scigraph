@@ -372,3 +372,34 @@ def test_serve_wave6_flags_and_dispatch(
     assert app.workspace_manager is not None
     assert app.org_id == "acme"
     assert app.workspace_id == "ws1"
+
+
+def test_serve_empty_tokens_file_fails_closed(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tokens_path = tmp_path / "empty_tokens.json"
+    tokens_path.write_text("[]", encoding="utf-8")
+
+    rc = main(["serve", "--tokens", str(tokens_path)])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "no policies" in captured.err
+
+
+def test_serve_org_or_workspace_without_workspace_root_exits_2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    rc_org = main(["serve", "--org", "acme"])
+    err_org = capsys.readouterr()
+    assert rc_org == 2
+    assert "--workspace-root" in err_org.err
+
+    rc_ws = main(["serve", "--workspace", "ws1"])
+    err_ws = capsys.readouterr()
+    assert rc_ws == 2
+    assert "--workspace-root" in err_ws.err

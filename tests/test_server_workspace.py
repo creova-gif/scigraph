@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from graph.claim_graph import ClaimGraph
 from scigraph.models import Paper
 from scigraph.security import AuthGate, TokenPolicy, hash_bearer_token
 from scigraph.server import SciGraphApp, load_token_policies
@@ -292,3 +293,14 @@ def test_workspace_org_isolation_and_deleted_workspace_errors(tmp_path: Path) ->
     )
     assert missing_status == 404
     assert "error" in json.loads(missing_body)
+
+
+def test_app_init_rejects_both_graph_and_workspace_manager(tmp_path: Path) -> None:
+    wm = WorkspaceManager(tmp_path)
+    wm.init_workspace("org-dup", "ws-dup", "Dup Workspace")
+    graph = ClaimGraph()
+    with pytest.raises(
+        ValueError,
+        match="Cannot configure both an explicit graph and a workspace_manager",
+    ):
+        SciGraphApp(graph, workspace_manager=wm, org_id="org-dup", workspace_id="ws-dup")

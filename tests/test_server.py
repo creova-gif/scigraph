@@ -15,7 +15,12 @@ from unittest.mock import patch
 from graph.claim_graph import ClaimGraph
 from ingest.extractor import extract_claims_from_paper
 from scigraph.models import Paper
-from scigraph.security import SlidingWindowRateLimiter
+from scigraph.security import (
+    AuthGate,
+    SlidingWindowRateLimiter,
+    TokenPolicy,
+    hash_bearer_token,
+)
 from scigraph.server import (
     MAX_REQUEST_BYTES,
     SciGraphApp,
@@ -540,3 +545,102 @@ def test_app_prioritize_and_method_not_allowed() -> None:
     assert post_status == 405
     assert post_ctype == "application/json"
     assert "error" in json.loads(post_body)
+
+
+def test_http_server_post_rejects_unauth_and_rate_limit_before_reading_body() -> None:
+    gate = AuthGate(
+        [
+            TokenPolicy(
+                token_sha256=hash_bearer_token("valid-ingestor"),
+                org_id="org-1",
+                role="ingestor",
+                label="ingestor",
+            )
+        ]
+    )
+    limiter = SlidingWindowRateLimiter(max_requests=1, window_seconds=60.0)
+
+    def _run_raw_post(app: SciGraphApp, auth_header: str | None = None) -> tuple[str, int]:
+        server = create_http_server("127.0.0.1", 0, app)
+        orig_setup = server.RequestHandlerClass.setup  # type: ignore[attr-defined]
+        read_calls = 0
+
+        def _spy_setup(handler: BaseHTTPRequestHandler) -> None:
+            orig_setup(handler)
+            orig_read = handler.rfile.read
+
+            def _guarded_read(size: int | None = -1) -> bytes:
+                nonlocal read_calls
+                read_calls += 1
+                return orig_read(size)
+
+            handler.rfile.read = _guarded_read  # type: ignore[method-assign]
+
+        try:
+            client_sock, server_sock = socket.socketpair()
+            try:
+                auth_line = f"Authorization: {auth_header}\r\n" if auth_header else ""
+                request_bytes = (
+                    f"POST /api/v1/verify HTTP/1.1\r\n"
+                    f"Host: localhost\r\n"
+                    f"Content-Length: 1024\r\n"
+                    f"{auth_line}"
+                    f"\r\n"
+                ).encode()
+                client_sock.sendall(request_bytes)
+                with patch.object(server.RequestHandlerClass, "setup", _spy_setup):
+                    server.RequestHandlerClass(server_sock, ("127.0.0.1", 12345), server)
+                response = client_sock.recv(4096).decode("utf-8")
+                return response, read_calls
+            finally:
+                client_sock.close()
+                server_sock.close()
+        finally:
+            server.server_close()
+
+    # 1. Unauthenticated POST rejects with 401 before calling rfile.read.
+    unauth_app = SciGraphApp(_build_populated_graph(), auth_gate=gate)
+    unauth_resp, unauth_reads = _run_raw_post(unauth_app)
+    assert "401 Unauthorized" in unauth_resp
+    assert unauth_reads == 0
+    _, _, unauth_metrics_body = unauth_app.handle_request("GET", "/metrics")
+    unauth_metrics = _parse_prometheus_metrics(unauth_metrics_body)
+    assert unauth_metrics["scigraph_requests_total"] == "1"
+    assert unauth_metrics["scigraph_errors_total"] == "1"
+
+    # 2. Rate-limited POST rejects with 429 before calling rfile.read.
+    limited_app = SciGraphApp(
+        _build_populated_graph(),
+        auth_gate=gate,
+        rate_limiter=limiter,
+    )
+    allowed, _, _ = limited_app.handle_request("GET", "/health", remote_addr="127.0.0.1")
+    assert allowed == 200
+    rate_resp, rate_reads = _run_raw_post(limited_app, auth_header="Bearer valid-ingestor")
+    assert "429 Too Many Requests" in rate_resp
+    assert rate_reads == 0
+    _, _, rate_metrics_body = limited_app.handle_request("GET", "/metrics", remote_addr="scraper")
+    rate_metrics = _parse_prometheus_metrics(rate_metrics_body)
+    assert rate_metrics["scigraph_requests_total"] == "2"
+    assert rate_metrics["scigraph_errors_total"] == "1"
+    assert rate_metrics["scigraph_rate_limited_total"] == "1"
+
+
+def test_http_server_413_increments_request_and_error_metrics() -> None:
+    app = SciGraphApp(_build_populated_graph())
+    with _running_server(app) as base_url:
+        oversized = b"x" * (MAX_REQUEST_BYTES + 1)
+        status, _, body = _http_request(
+            f"{base_url}/api/v1/verify",
+            method="POST",
+            data=oversized,
+            headers={"Content-Type": "application/json"},
+        )
+        assert status == 413
+        assert "exceeds" in json.loads(body)["error"]
+
+    metrics_status, _, metrics_body = app.handle_request("GET", "/metrics")
+    assert metrics_status == 200
+    metrics = _parse_prometheus_metrics(metrics_body)
+    assert metrics["scigraph_requests_total"] == "1"
+    assert metrics["scigraph_errors_total"] == "1"

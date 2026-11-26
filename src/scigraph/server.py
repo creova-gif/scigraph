@@ -260,6 +260,8 @@ class SciGraphApp:
         org_id: str | None = None,
         workspace_id: str | None = None,
     ) -> None:
+        if graph is not None and workspace_manager is not None:
+            raise ValueError("Cannot configure both an explicit graph and a workspace_manager")
         self.auth_gate: AuthGate | None = auth_gate
         self.rate_limiter: SlidingWindowRateLimiter | None = rate_limiter
         self.workspace_manager: WorkspaceManager | None = workspace_manager
@@ -299,37 +301,45 @@ class SciGraphApp:
         )
         return (resp.status, resp.content_type, resp.body)
 
-    def _dispatch(
-        self,
-        method: str,
-        target: str,
-        body: bytes,
-        incoming_header: str | None,
-        remote_addr: str,
-    ) -> ServerResponse:
-        resp = self._route_request(
-            method,
-            target,
-            body,
-            incoming_header,
-            remote_addr,
-        )
+    def _record_metrics(self, status: int) -> None:
         with self._lock:
             self._requests_total += 1
-            if resp.status == HTTPStatus.TOO_MANY_REQUESTS:
+            if status == HTTPStatus.TOO_MANY_REQUESTS:
                 self._rate_limited_total += 1
-            if resp.status >= 400:
+            if status >= 400:
                 self._errors_total += 1
-        return resp
 
-    def _route_request(
+    def record_transport_error(self, status: int) -> None:
+        """Record an HTTP-layer error (400/408/413) in request metrics before dispatch."""
+        self._record_metrics(status)
+
+    def check_pre_body_guards(
         self,
         method: str,
         target: str,
-        body: bytes,
+        *,
+        incoming_header: str | None = None,
+        remote_addr: str = "local",
+    ) -> ServerResponse | None:
+        """Check rate limiter and auth gate before reading a request body."""
+        resp = self._evaluate_pre_body_guards(
+            method.upper(),
+            target,
+            incoming_header=incoming_header,
+            remote_addr=remote_addr,
+        )
+        if resp is not None:
+            self._record_metrics(resp.status)
+        return resp
+
+    def _evaluate_pre_body_guards(
+        self,
+        method: str,
+        target: str,
+        *,
         incoming_header: str | None,
         remote_addr: str,
-    ) -> ServerResponse:
+    ) -> ServerResponse | None:
         if self.rate_limiter is not None:
             allowed, retry_after = self.rate_limiter.check(remote_addr)
             if not allowed:
@@ -346,7 +356,6 @@ class SciGraphApp:
         except ValueError as exc:
             return _error_response(HTTPStatus.BAD_REQUEST, f"Malformed request target: {exc}")
         path = parsed.path or "/"
-        params = parse_qs(parsed.query, keep_blank_values=False)
 
         if (
             self.auth_gate is not None
@@ -364,6 +373,56 @@ class SciGraphApp:
                     HTTPStatus.FORBIDDEN,
                     "Token org_id does not match workspace org_id",
                 )
+
+        return None
+
+    def _dispatch(
+        self,
+        method: str,
+        target: str,
+        body: bytes,
+        incoming_header: str | None,
+        remote_addr: str,
+        *,
+        skip_pre_body_guards: bool = False,
+    ) -> ServerResponse:
+        resp = self._route_request(
+            method,
+            target,
+            body,
+            incoming_header,
+            remote_addr,
+            skip_pre_body_guards=skip_pre_body_guards,
+        )
+        self._record_metrics(resp.status)
+        return resp
+
+    def _route_request(
+        self,
+        method: str,
+        target: str,
+        body: bytes,
+        incoming_header: str | None,
+        remote_addr: str,
+        *,
+        skip_pre_body_guards: bool = False,
+    ) -> ServerResponse:
+        if not skip_pre_body_guards:
+            guard_resp = self._evaluate_pre_body_guards(
+                method,
+                target,
+                incoming_header=incoming_header,
+                remote_addr=remote_addr,
+            )
+            if guard_resp is not None:
+                return guard_resp
+
+        try:
+            parsed = urlsplit(target)
+        except ValueError as exc:
+            return _error_response(HTTPStatus.BAD_REQUEST, f"Malformed request target: {exc}")
+        path = parsed.path or "/"
+        params = parse_qs(parsed.query, keep_blank_values=False)
 
         if path == "/":
             return self._require_get(method, lambda: self._handle_explorer())
@@ -690,24 +749,43 @@ def create_http_server(
             )
             self._write_response(status, content_type, body_text)
 
+        def _send_transport_error(self, status: HTTPStatus, message: str) -> None:
+            app.record_transport_error(status)
+            self._write_response(
+                status,
+                "application/json",
+                json.dumps({"error": message}) + "\n",
+            )
+
         def do_POST(self) -> None:
             self._current_request_id = _sanitize_request_id(self.headers.get("X-Request-Id"))
+            hdr_value = self.headers.get("Authorization")
+            remote_addr = self.client_address[0]
+            guard_resp = app.check_pre_body_guards(
+                "POST",
+                self.path,
+                incoming_header=hdr_value,
+                remote_addr=remote_addr,
+            )
+            if guard_resp is not None:
+                self._write_response(
+                    guard_resp.status,
+                    guard_resp.content_type,
+                    guard_resp.body,
+                )
+                return
+
             raw_len = self.headers.get("Content-Length", "0")
             try:
                 content_length = int(raw_len)
             except ValueError:
-                self._write_response(
-                    HTTPStatus.BAD_REQUEST,
-                    "application/json",
-                    json.dumps({"error": "Invalid Content-Length header"}) + "\n",
-                )
+                self._send_transport_error(HTTPStatus.BAD_REQUEST, "Invalid Content-Length header")
                 return
 
             if content_length < 0:
-                self._write_response(
+                self._send_transport_error(
                     HTTPStatus.BAD_REQUEST,
-                    "application/json",
-                    json.dumps({"error": "Negative Content-Length header"}) + "\n",
+                    "Negative Content-Length header",
                 )
                 return
 
@@ -721,37 +799,34 @@ def create_http_server(
                                 break
                             remaining -= len(chunk)
                     except TimeoutError:
-                        self._write_response(
+                        self._send_transport_error(
                             HTTPStatus.REQUEST_TIMEOUT,
-                            "application/json",
-                            json.dumps({"error": "Request body read timed out"}) + "\n",
+                            "Request body read timed out",
                         )
                         return
-                self._write_response(
+                self._send_transport_error(
                     HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                    "application/json",
-                    json.dumps({"error": f"Request body exceeds {MAX_REQUEST_BYTES} bytes"}) + "\n",
+                    f"Request body exceeds {MAX_REQUEST_BYTES} bytes",
                 )
                 return
 
             try:
                 body = self.rfile.read(content_length) if content_length > 0 else b""
             except TimeoutError:
-                self._write_response(
+                self._send_transport_error(
                     HTTPStatus.REQUEST_TIMEOUT,
-                    "application/json",
-                    json.dumps({"error": "Request body read timed out"}) + "\n",
+                    "Request body read timed out",
                 )
                 return
-            hdr_value = self.headers.get("Authorization")
-            status, content_type, body_text = app.handle_request(
+            resp = app._dispatch(
                 "POST",
                 self.path,
                 body,
-                incoming_header=hdr_value,
-                remote_addr=self.client_address[0],
+                hdr_value,
+                remote_addr,
+                skip_pre_body_guards=True,
             )
-            self._write_response(status, content_type, body_text)
+            self._write_response(resp.status, resp.content_type, resp.body)
 
         def _write_response(self, status: int, content_type: str, body_text: str) -> None:
             payload = body_text.encode("utf-8")
