@@ -1,3 +1,15 @@
+from solver.prioritizer import (
+    CostTier,
+    PrioritizedExperiment,
+    prioritize_experiments,
+)
+from solver.protocols import (
+    ExperimentProtocol,
+    ProtocolPhase,
+    ProtocolStep,
+    generate_experiment_protocols,
+    render_protocols_markdown,
+)
 from solver.regime import (
     RegimeParameter,
     compute_regime_delta,
@@ -13,6 +25,11 @@ from solver.symbolic import (
 )
 
 __all__ = [
+    "CostTier",
+    "ExperimentProtocol",
+    "PrioritizedExperiment",
+    "ProtocolPhase",
+    "ProtocolStep",
     "RegimeParameter",
     "check_claim_set_satisfiability",
     "compute_powered_sample_size",
@@ -20,6 +37,9 @@ __all__ = [
     "detect_contradictions",
     "direction_to_symbolic_int",
     "extract_regime_parameters",
+    "generate_experiment_protocols",
     "parse_standardized_effect_size",
+    "prioritize_experiments",
     "propose_falsifiable_experiments",
+    "render_protocols_markdown",
 ]

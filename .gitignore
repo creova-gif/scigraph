@@ -12,3 +12,9 @@ build/
 decisions.tsv
 .audit/
 .agents/skills/*
+.DS_Store
+.coverage
+coverage.xml
+*.db
+*.sqlite
+*.sqlite3

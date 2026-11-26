@@ -28,6 +28,9 @@ _CRATE_PATTERN = re.compile(
 _MOLARITY_PATTERN = re.compile(r"(?P<val>\d+(?:\.\d+)?)\s*(?P<unit>mM|M)\b")
 _MASS_CONC_PATTERN = re.compile(r"(?P<val>\d+(?:\.\d+)?)\s*(?P<unit>ng/mL)\b")
 _FREQ_PATTERN = re.compile(r"(?P<val>\d+(?:\.\d+)?)\s*(?P<unit>Hz)\b")
+_PH_PATTERN = re.compile(r"\bpH\s*(?P<val>\d+(?:\.\d+)?)\b", re.IGNORECASE)
+_PRESSURE_PATTERN = re.compile(r"(?P<val>\d+(?:\.\d+)?)\s*(?P<unit>MPa|kPa|Pa|bar|atm)\b")
+_DOSAGE_PATTERN = re.compile(r"(?P<val>\d+(?:\.\d+)?)\s*(?P<unit>mg/kg|ug/kg|g/kg)\b")
 
 
 def _normalize_temperature(value: float, unit: str) -> tuple[float, str]:
@@ -42,6 +45,26 @@ def _normalize_molarity(value: float, unit: str) -> tuple[float, str]:
     return (value, "M")
 
 
+def _normalize_pressure(value: float, unit: str) -> tuple[float, str]:
+    if unit == "MPa":
+        return (value * 1000.0, "kPa")
+    if unit == "Pa":
+        return (value / 1000.0, "kPa")
+    if unit == "bar":
+        return (value * 100.0, "kPa")
+    if unit == "atm":
+        return (value * 101.325, "kPa")
+    return (value, "kPa")
+
+
+def _normalize_dosage(value: float, unit: str) -> tuple[float, str]:
+    if unit == "g/kg":
+        return (value * 1000.0, "mg/kg")
+    if unit == "ug/kg":
+        return (value / 1000.0, "mg/kg")
+    return (value, "mg/kg")
+
+
 _PATTERN_SPECS: tuple[
     tuple[str, re.Pattern[str], str, Callable[[float, str], tuple[float, str]] | None],
     ...,
@@ -52,6 +75,9 @@ _PATTERN_SPECS: tuple[
     ("molarity", _MOLARITY_PATTERN, "M", _normalize_molarity),
     ("mass_concentration", _MASS_CONC_PATTERN, "ng/mL", None),
     ("frequency", _FREQ_PATTERN, "Hz", None),
+    ("ph", _PH_PATTERN, "pH", None),
+    ("pressure", _PRESSURE_PATTERN, "kPa", _normalize_pressure),
+    ("dosage", _DOSAGE_PATTERN, "mg/kg", _normalize_dosage),
 )
 
 

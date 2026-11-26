@@ -1,4 +1,5 @@
 import re
+import zlib
 from collections.abc import Sequence
 
 from scigraph.models import (
@@ -60,6 +61,34 @@ _PDF_BLOCK_PATTERN = re.compile(
 )
 
 MAX_PDF_BYTES = 25 * 1024 * 1024
+MAX_DECOMPRESSED_BYTES = 50 * 1024 * 1024
+
+_ENCRYPT_PATTERN = re.compile(rb"/Encrypt\b")
+_STREAM_PATTERN = re.compile(
+    rb"stream\r?\n(?P<data>.*?)(?:\r?\n)?endstream",
+    re.DOTALL,
+)
+_DICT_BEFORE_STREAM_PATTERN = re.compile(rb"<<(?P<dict>.*?)>>\s*$", re.DOTALL)
+_FILTER_SINGLE_PATTERN = re.compile(rb"/Filter\s*/(?P<name>[A-Za-z0-9]+)")
+_FILTER_ARRAY_PATTERN = re.compile(rb"/Filter\s*\[(?P<names>[^\]]*)\]")
+_PDF_STRING_ESCAPE_PATTERN = re.compile(r"\\([()\\nrt])")
+_TJ_ARRAY_TOKEN_PATTERN = re.compile(
+    r"\((?P<str>(?:\\.|[^\\)])*)\)|(?P<num>-?\d+(?:\.\d+)?)"
+)
+_TEXT_OP_PATTERN = re.compile(
+    r"\((?P<tj>(?:\\.|[^\\)])*)\)\s*Tj|"
+    r"\[(?P<tj_arr>(?:\((?:\\.|[^\\)])*\)|[^\]])*)\]\s*TJ",
+    re.DOTALL,
+)
+
+_ESCAPE_MAP: dict[str, str] = {
+    "(": "(",
+    ")": ")",
+    "\\": "\\",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
 
 
 def normalize_pdf_text(text: str) -> str:
@@ -213,28 +242,131 @@ def render_blocks_to_pdf_bytes(
     return "\n".join(lines).encode("utf-8")
 
 
+def _validate_pdf_bytes(pdf_bytes: bytes, label: str = "PDF") -> None:
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        raise ValueError(
+            f"PDF exceeds MAX_PDF_BYTES ({MAX_PDF_BYTES} bytes) for {label}"
+        )
+    if not pdf_bytes.startswith(b"%PDF-"):
+        raise ValueError(f"Invalid PDF header for {label}: expected %PDF- magic bytes")
+    if _ENCRYPT_PATTERN.search(pdf_bytes) is not None:
+        raise ValueError(f"Encrypted PDFs (/Encrypt) are not supported for {label}")
+
+
+def _extract_stream_filters(dict_bytes: bytes) -> list[bytes]:
+    array_match = _FILTER_ARRAY_PATTERN.search(dict_bytes)
+    if array_match is not None:
+        return re.findall(rb"/([A-Za-z0-9]+)", array_match.group("names"))
+    single_match = _FILTER_SINGLE_PATTERN.search(dict_bytes)
+    if single_match is not None:
+        return [single_match.group("name")]
+    return []
+
+
+def _decompress_flate(data: bytes, label: str = "PDF") -> bytes:
+    decompressor = zlib.decompressobj()
+    try:
+        out = decompressor.decompress(data, MAX_DECOMPRESSED_BYTES + 1)
+        if len(out) > MAX_DECOMPRESSED_BYTES or decompressor.unconsumed_tail:
+            raise ValueError(
+                f"/FlateDecode stream exceeds MAX_DECOMPRESSED_BYTES "
+                f"({MAX_DECOMPRESSED_BYTES} bytes) for {label}"
+            )
+        tail = decompressor.flush()
+        if len(out) + len(tail) > MAX_DECOMPRESSED_BYTES:
+            raise ValueError(
+                f"/FlateDecode stream exceeds MAX_DECOMPRESSED_BYTES "
+                f"({MAX_DECOMPRESSED_BYTES} bytes) for {label}"
+            )
+        return out + tail
+    except zlib.error as exc:
+        raise ValueError(
+            f"Invalid /FlateDecode stream for {label}: {exc}"
+        ) from exc
+
+
+def _decode_pdf_streams(pdf_bytes: bytes, label: str = "PDF") -> list[str]:
+    decoded_streams: list[str] = []
+    for match in _STREAM_PATTERN.finditer(pdf_bytes):
+        prefix_start = max(
+            pdf_bytes.rfind(b"endobj", 0, match.start()),
+            pdf_bytes.rfind(b"obj", 0, match.start()),
+            0,
+        )
+        header_slice = pdf_bytes[prefix_start:match.start()]
+        dict_match = _DICT_BEFORE_STREAM_PATTERN.search(header_slice)
+        raw_data = match.group("data")
+        if dict_match is not None:
+            filters = _extract_stream_filters(dict_match.group("dict"))
+            if filters:
+                if filters == [b"FlateDecode"]:
+                    raw_data = _decompress_flate(raw_data, label=label)
+                else:
+                    names = ", ".join(f.decode("latin-1") for f in filters)
+                    raise ValueError(
+                        f"Unsupported PDF stream filter(s) for {label}: {names}"
+                    )
+        decoded_streams.append(raw_data.decode("latin-1"))
+    return decoded_streams
+
+
+def _unescape_pdf_string(raw: str) -> str:
+    unescaped = _PDF_STRING_ESCAPE_PATTERN.sub(
+        lambda m: _ESCAPE_MAP[m.group(1)],
+        raw,
+    )
+    return unescaped.encode("latin-1").decode("utf-8", errors="replace")
+
+
+def _decode_tj_array(raw_array: str) -> str:
+    parts: list[str] = []
+    for token in _TJ_ARRAY_TOKEN_PATTERN.finditer(raw_array):
+        str_part = token.group("str")
+        if str_part is not None:
+            parts.append(_unescape_pdf_string(str_part))
+            continue
+        num_part = token.group("num")
+        if num_part is not None and float(num_part) <= -150.0 and parts:
+            if not parts[-1].endswith((" ", "\n", "\t")):
+                parts.append(" ")
+    return "".join(parts)
+
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Extract and normalize text from uncompressed or /FlateDecode PDF bytes."""
+    _validate_pdf_bytes(pdf_bytes, label="PDF")
+    streams = _decode_pdf_streams(pdf_bytes, label="PDF")
+    if not streams:
+        raise ValueError("No content streams found in PDF")
+
+    chunks: list[str] = []
+    for stream_text in streams:
+        for match in _TEXT_OP_PATTERN.finditer(stream_text):
+            tj = match.group("tj")
+            if tj is not None:
+                text = normalize_pdf_text(_unescape_pdf_string(tj))
+            else:
+                text = normalize_pdf_text(_decode_tj_array(match.group("tj_arr")))
+            if text:
+                chunks.append(text)
+
+    if not chunks:
+        raise ValueError("No extractable text operators found in PDF stream")
+    return "\n".join(chunks)
+
+
 def extract_paper_from_pdf_bytes(
     paper_id: str,
     pdf_bytes: bytes,
     page_width: float = 612.0,
 ) -> Paper:
-    if len(pdf_bytes) > MAX_PDF_BYTES:
-        raise ValueError(
-            f"PDF exceeds MAX_PDF_BYTES ({MAX_PDF_BYTES} bytes) for {paper_id}"
-        )
-    if not pdf_bytes.startswith(b"%PDF-"):
-        raise ValueError(f"Invalid PDF header for {paper_id}: expected %PDF- magic bytes")
+    _validate_pdf_bytes(pdf_bytes, label=paper_id)
+    streams = _decode_pdf_streams(pdf_bytes, label=paper_id)
+    search_space = "\n".join(streams) if streams else pdf_bytes.decode("latin-1")
 
-    decoded = pdf_bytes.decode("latin-1")
     blocks: list[LayoutBlock] = []
-    for match in _PDF_BLOCK_PATTERN.finditer(decoded):
-        raw_escaped = (
-            match.group("text")
-            .replace("\\(", "(")
-            .replace("\\)", ")")
-            .replace("\\\\", "\\")
-        )
-        raw_text = raw_escaped.encode("latin-1").decode("utf-8", errors="replace")
+    for match in _PDF_BLOCK_PATTERN.finditer(search_space):
+        raw_text = _unescape_pdf_string(match.group("text"))
         blocks.append(
             LayoutBlock(
                 page_number=int(match.group("page")),
@@ -246,11 +378,6 @@ def extract_paper_from_pdf_bytes(
             )
         )
     if not blocks:
-        if "/FlateDecode" in decoded:
-            raise ValueError(
-                f"Compressed /FlateDecode PDF streams without uncompressed text blocks "
-                f"are not supported for {paper_id}"
-            )
         raise ValueError(f"No layout blocks found in PDF stream for {paper_id}")
     return extract_paper_from_layout(paper_id=paper_id, blocks=blocks, page_width=page_width)
 

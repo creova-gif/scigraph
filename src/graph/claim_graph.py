@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from itertools import combinations
+from typing import Any
 
 from ingest.verifier import verify_claim_verbatim
 from scigraph.models import (
@@ -112,29 +115,69 @@ class ClaimGraph:
 
     def query_claims(
         self,
+        *,
         intervention: str | None = None,
         condition: str | None = None,
         outcome: str | None = None,
-        direction: EffectDirection | None = None,
+        effect_direction: EffectDirection | None = None,
+        paper_id: str | None = None,
     ) -> tuple[ScientificClaim, ...]:
+        """Filter claims by case-insensitive substrings and exact direction/paper_id."""
         matched: list[ScientificClaim] = []
-        norm_i = _normalize_entity(intervention) if intervention else None
-        norm_c = _normalize_entity(condition) if condition else None
-        norm_o = _normalize_entity(outcome) if outcome else None
+        needle_i = intervention.casefold() if intervention is not None else None
+        needle_c = condition.casefold() if condition is not None else None
+        needle_o = outcome.casefold() if outcome is not None else None
 
         for claim in self._claims.values():
             ct = claim.claim_tuple
-            if norm_i and _normalize_entity(ct.intervention) != norm_i:
+            if needle_i is not None and needle_i not in ct.intervention.casefold():
                 continue
-            if norm_c and _normalize_entity(ct.condition) != norm_c:
+            if needle_c is not None and needle_c not in ct.condition.casefold():
                 continue
-            if norm_o and _normalize_entity(ct.outcome) != norm_o:
+            if needle_o is not None and needle_o not in ct.outcome.casefold():
                 continue
-            if direction is not None and ct.direction != direction:
+            if effect_direction is not None and ct.direction != effect_direction:
+                continue
+            if paper_id is not None and claim.paper_id != paper_id:
                 continue
             matched.append(claim)
 
         return tuple(matched)
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize papers, claims, and edges into a JSON-compatible dictionary."""
+        return {
+            "papers": [paper.model_dump(mode="json") for paper in self._papers.values()],
+            "claims": [claim.model_dump(mode="json") for claim in self._claims.values()],
+            "edges": [edge.model_dump(mode="json") for edge in self._edges.values()],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ClaimGraph:
+        """Reconstruct and validate a ClaimGraph from a serialized dictionary."""
+        raw_papers = data.get("papers", [])
+        raw_claims = data.get("claims", [])
+        raw_edges = data.get("edges", [])
+        if (
+            not isinstance(raw_papers, list)
+            or not isinstance(raw_claims, list)
+            or not isinstance(raw_edges, list)
+        ):
+            raise ValueError(
+                "ClaimGraph dictionary requires list values for 'papers', 'claims', and 'edges'"
+            )
+
+        graph = cls()
+        for raw_paper in raw_papers:
+            paper = Paper.model_validate(raw_paper, strict=False)
+            graph._papers[paper.paper_id] = paper
+        for raw_claim in raw_claims:
+            claim = ScientificClaim.model_validate(raw_claim, strict=False)
+            graph._claims[claim.claim_id] = claim
+        for raw_edge in raw_edges:
+            edge = EvidenceEdge.model_validate(raw_edge, strict=False)
+            graph._edges[edge.edge_id] = edge
+        return graph
 
     def edges_for_claim(self, claim_id: str) -> tuple[EvidenceEdge, ...]:
         return tuple(
