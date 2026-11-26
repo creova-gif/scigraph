@@ -8,11 +8,14 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler
 from typing import Any
+from unittest.mock import patch
 
 from graph.claim_graph import ClaimGraph
 from ingest.extractor import extract_claims_from_paper
 from scigraph.models import Paper
+from scigraph.security import SlidingWindowRateLimiter
 from scigraph.server import (
     MAX_REQUEST_BYTES,
     SciGraphApp,
@@ -121,6 +124,7 @@ def test_app_health_and_openapi() -> None:
     assert spec["openapi"] == "3.1.0"
     for route in (
         "/health",
+        "/metrics",
         "/api/v1/claims",
         "/api/v1/contradictions",
         "/api/v1/report",
@@ -370,3 +374,97 @@ def test_sanitize_request_id_and_http_correlation_header() -> None:
         )
         assert status == 400
         assert headers["x-request-id"] == "post-req-99"
+
+
+def _parse_prometheus_metrics(body: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        name, value = stripped.split(" ", 1)
+        parsed[name] = value
+    return parsed
+
+
+def test_app_metrics_prometheus_and_counters() -> None:
+    app = SciGraphApp(
+        _build_populated_graph(),
+        rate_limiter=SlidingWindowRateLimiter(max_requests=3, window_seconds=60.0),
+    )
+
+    s1, _, _ = app.handle_request("GET", "/health", remote_addr="client-a")
+    assert s1 == 200
+    s2, _, _ = app.handle_request("GET", "/nonexistent", remote_addr="client-a")
+    assert s2 == 404
+    s3, _, _ = app.handle_request("GET", "/health", remote_addr="client-a")
+    assert s3 == 200
+    s4, _, _ = app.handle_request("GET", "/health", remote_addr="client-a")
+    assert s4 == 429
+
+    status, ctype, body = app.handle_request("GET", "/metrics", remote_addr="scraper")
+    assert status == 200
+    assert ctype == "text/plain; version=0.0.4; charset=utf-8"
+
+    for metric_name in (
+        "scigraph_requests_total",
+        "scigraph_errors_total",
+        "scigraph_rate_limited_total",
+        "scigraph_papers_total",
+        "scigraph_claims_total",
+        "scigraph_uptime_seconds",
+    ):
+        assert f"# HELP {metric_name} " in body
+        assert f"# TYPE {metric_name} " in body
+
+    metrics = _parse_prometheus_metrics(body)
+    assert metrics["scigraph_requests_total"] == "4"
+    assert metrics["scigraph_errors_total"] == "2"
+    assert metrics["scigraph_rate_limited_total"] == "1"
+    assert metrics["scigraph_papers_total"] == "2"
+    assert metrics["scigraph_claims_total"] == "2"
+    assert float(metrics["scigraph_uptime_seconds"]) >= 0.0
+
+    # A subsequent scrape reflects the previous GET /metrics request.
+    status2, _, body2 = app.handle_request("GET", "/metrics", remote_addr="scraper")
+    assert status2 == 200
+    metrics2 = _parse_prometheus_metrics(body2)
+    assert metrics2["scigraph_requests_total"] == "5"
+    assert metrics2["scigraph_errors_total"] == "2"
+    assert metrics2["scigraph_rate_limited_total"] == "1"
+
+    method_status, _, _ = app.handle_request("POST", "/metrics", remote_addr="scraper")
+    assert method_status == 405
+
+
+def test_http_server_post_body_read_timeout_returns_408() -> None:
+    app = SciGraphApp(_build_populated_graph())
+    server = create_http_server("127.0.0.1", 0, app)
+    orig_setup = server.RequestHandlerClass.setup  # type: ignore[attr-defined]
+
+    def _timeout_setup(handler: BaseHTTPRequestHandler) -> None:
+        orig_setup(handler)
+        handler.request.settimeout(0.05)
+
+    try:
+        client_sock, server_sock = socket.socketpair()
+        try:
+            client_sock.sendall(
+                b"POST /api/v1/verify HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Content-Length: 64\r\n"
+                b"X-Request-Id: timeout-req-1\r\n"
+                b"\r\n"
+            )
+            with patch.object(server.RequestHandlerClass, "setup", _timeout_setup):
+                server.RequestHandlerClass(server_sock, ("127.0.0.1", 12345), server)
+            response = client_sock.recv(4096).decode("utf-8")
+            assert "408 Request Timeout" in response
+            assert "X-Request-Id: timeout-req-1" in response
+            _, _, body_part = response.partition("\r\n\r\n")
+            assert json.loads(body_part) == {"error": "Request body read timed out"}
+        finally:
+            client_sock.close()
+            server_sock.close()
+    finally:
+        server.server_close()

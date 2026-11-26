@@ -142,30 +142,48 @@ def _cmd_serve(
     workspace: str | None = None,
 ) -> int:
     try:
-        if tokens is None and rate_limit is None and workspace_root is None:
+        cfg = load_scigraph_config()
+        resolved_store = store if store is not None else cfg.default_store
+        resolved_workspace_root = (
+            workspace_root if workspace_root is not None else cfg.workspace_root
+        )
+        resolved_rate_limit = rate_limit if rate_limit is not None else cfg.rate_limit
+        resolved_rate_window = cfg.rate_window_seconds if rate_window == 60.0 else rate_window
+        resolved_org = org if org is not None else cfg.default_org
+
+        if (
+            tokens is None
+            and resolved_rate_limit is None
+            and resolved_workspace_root is None
+        ):
             _resolve_cli_attr("run_server", run_server)(
                 host=host,
                 port=port,
-                store_path=Path(store) if store else None,
+                store_path=Path(resolved_store) if resolved_store else None,
             )
             return 0
 
         auth_gate = AuthGate(load_token_policies(Path(tokens))) if tokens is not None else None
         rate_limiter = (
-            SlidingWindowRateLimiter(max_requests=rate_limit, window_seconds=rate_window)
-            if rate_limit is not None
+            SlidingWindowRateLimiter(
+                max_requests=resolved_rate_limit,
+                window_seconds=resolved_rate_window,
+            )
+            if resolved_rate_limit is not None
             else None
         )
         workspace_manager = (
-            WorkspaceManager(Path(workspace_root)) if workspace_root is not None else None
+            WorkspaceManager(Path(resolved_workspace_root))
+            if resolved_workspace_root is not None
+            else None
         )
-        graph = _load_graph_from_store(Path(store)) if store is not None else None
+        graph = _load_graph_from_store(Path(resolved_store)) if resolved_store is not None else None
         app = SciGraphApp(
             graph=graph,
             auth_gate=auth_gate,
             rate_limiter=rate_limiter,
             workspace_manager=workspace_manager,
-            org_id=org,
+            org_id=resolved_org,
             workspace_id=workspace,
         )
         server = _resolve_cli_attr("create_http_server", create_http_server)(host, port, app)

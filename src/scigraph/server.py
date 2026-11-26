@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from http import HTTPStatus
@@ -116,6 +117,21 @@ def _build_openapi_spec() -> dict[str, Any]:
                         "200": {
                             "description": "Service health status",
                             "content": {"application/json": {"schema": {"type": "object"}}},
+                        }
+                    },
+                }
+            },
+            "/metrics": {
+                "get": {
+                    "summary": "Prometheus-format operational metrics",
+                    "responses": {
+                        "200": {
+                            "description": "Prometheus text exposition metrics",
+                            "content": {
+                                "text/plain; version=0.0.4; charset=utf-8": {
+                                    "schema": {"type": "string"}
+                                }
+                            },
                         }
                     },
                 }
@@ -242,6 +258,10 @@ class SciGraphApp:
         else:
             self.graph = ClaimGraph()
         self._lock = threading.Lock()
+        self._started_at: float = time.monotonic()
+        self._requests_total: int = 0
+        self._errors_total: int = 0
+        self._rate_limited_total: int = 0
 
     def handle_request(
         self,
@@ -262,6 +282,29 @@ class SciGraphApp:
         return (resp.status, resp.content_type, resp.body)
 
     def _dispatch(
+        self,
+        method: str,
+        target: str,
+        body: bytes,
+        incoming_header: str | None,
+        remote_addr: str,
+    ) -> ServerResponse:
+        resp = self._route_request(
+            method,
+            target,
+            body,
+            incoming_header,
+            remote_addr,
+        )
+        with self._lock:
+            self._requests_total += 1
+            if resp.status == HTTPStatus.TOO_MANY_REQUESTS:
+                self._rate_limited_total += 1
+            if resp.status >= 400:
+                self._errors_total += 1
+        return resp
+
+    def _route_request(
         self,
         method: str,
         target: str,
@@ -308,6 +351,8 @@ class SciGraphApp:
             return self._require_get(method, lambda: self._handle_explorer())
         if path == "/health":
             return self._require_get(method, lambda: self._handle_health())
+        if path == "/metrics":
+            return self._require_get(method, lambda: self._handle_metrics())
         if path == "/openapi.json":
             return self._require_get(method, lambda: _json_response(200, _build_openapi_spec()))
         if path == "/api/v1/claims":
@@ -355,6 +400,40 @@ class SciGraphApp:
                 "papers": paper_count,
                 "claims": claim_count,
             },
+        )
+
+    def _handle_metrics(self) -> ServerResponse:
+        with self._lock:
+            requests_total = self._requests_total
+            errors_total = self._errors_total
+            rate_limited_total = self._rate_limited_total
+            paper_count = len(self.graph.papers)
+            claim_count = len(self.graph.claims)
+        uptime_seconds = max(0.0, time.monotonic() - self._started_at)
+        lines = [
+            "# HELP scigraph_requests_total Total number of HTTP requests processed",
+            "# TYPE scigraph_requests_total counter",
+            f"scigraph_requests_total {requests_total}",
+            "# HELP scigraph_errors_total Total number of HTTP responses with status >= 400",
+            "# TYPE scigraph_errors_total counter",
+            f"scigraph_errors_total {errors_total}",
+            "# HELP scigraph_rate_limited_total Total number of HTTP 429 rate-limited responses",
+            "# TYPE scigraph_rate_limited_total counter",
+            f"scigraph_rate_limited_total {rate_limited_total}",
+            "# HELP scigraph_papers_total Total number of papers in the claim graph",
+            "# TYPE scigraph_papers_total gauge",
+            f"scigraph_papers_total {paper_count}",
+            "# HELP scigraph_claims_total Total number of claims in the claim graph",
+            "# TYPE scigraph_claims_total gauge",
+            f"scigraph_claims_total {claim_count}",
+            "# HELP scigraph_uptime_seconds Seconds since SciGraphApp initialization",
+            "# TYPE scigraph_uptime_seconds gauge",
+            f"scigraph_uptime_seconds {uptime_seconds:.6f}",
+        ]
+        return ServerResponse(
+            status=HTTPStatus.OK,
+            content_type="text/plain; version=0.0.4; charset=utf-8",
+            body="\n".join(lines) + "\n",
         )
 
     def _handle_claims(self, params: dict[str, list[str]]) -> ServerResponse:
@@ -586,11 +665,19 @@ def create_http_server(
             if content_length > MAX_REQUEST_BYTES:
                 if content_length <= MAX_REQUEST_BYTES * 2:
                     remaining = content_length
-                    while remaining > 0:
-                        chunk = self.rfile.read(min(remaining, 65536))
-                        if not chunk:
-                            break
-                        remaining -= len(chunk)
+                    try:
+                        while remaining > 0:
+                            chunk = self.rfile.read(min(remaining, 65536))
+                            if not chunk:
+                                break
+                            remaining -= len(chunk)
+                    except TimeoutError:
+                        self._write_response(
+                            HTTPStatus.REQUEST_TIMEOUT,
+                            "application/json",
+                            json.dumps({"error": "Request body read timed out"}) + "\n",
+                        )
+                        return
                 self._write_response(
                     HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                     "application/json",
@@ -598,7 +685,15 @@ def create_http_server(
                 )
                 return
 
-            body = self.rfile.read(content_length) if content_length > 0 else b""
+            try:
+                body = self.rfile.read(content_length) if content_length > 0 else b""
+            except TimeoutError:
+                self._write_response(
+                    HTTPStatus.REQUEST_TIMEOUT,
+                    "application/json",
+                    json.dumps({"error": "Request body read timed out"}) + "\n",
+                )
+                return
             hdr_value = self.headers.get("Authorization")
             status, content_type, body_text = app.handle_request(
                 "POST",

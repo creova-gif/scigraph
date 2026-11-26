@@ -7,6 +7,7 @@ from pathlib import Path
 
 from evals.benchmark import BENCHMARK_30_PAPERS, evaluate_benchmark, run_benchmark_audit
 from graph.claim_graph import ClaimGraph
+from graph.store import GraphSQLiteStore, load_graph_json
 from ingest.connectors import (  # noqa: F401 - re-exported for test monkeypatching
     fetch_arxiv_papers,
     fetch_europepmc_papers,
@@ -23,6 +24,7 @@ from scigraph.alerts import (  # noqa: F401 - re-exported for test monkeypatchin
     dispatch_webhook_alert,
 )
 from scigraph.cli_handlers import (
+    _SQLITE_SUFFIXES,
     _atomic_write_text,
     _cmd_alert,
     _cmd_canonicalize,
@@ -40,7 +42,7 @@ from scigraph.cli_handlers import (
     _cmd_serve,
     _cmd_workspace,
     _load_audit_events,  # noqa: F401 - re-exported for compatibility
-    _load_graph_from_store,
+    _load_graph_from_store,  # noqa: F401 - re-exported for compatibility
     _save_graph_to_store,
     _write_or_stdout,  # noqa: F401 - re-exported for compatibility
 )
@@ -262,18 +264,36 @@ def _cmd_query(
 ) -> int:
     try:
         parsed_direction = EffectDirection(direction) if direction is not None else None
-        graph = _load_graph_from_store(Path(store))
+        store_path = Path(store)
+        if not store_path.exists():
+            raise ValueError(f"Store path does not exist: {store_path}")
+        if not store_path.is_file():
+            raise ValueError(f"Store path is not a file: {store_path}")
+        suffix = store_path.suffix.lower()
+        if suffix == ".json":
+            matched = load_graph_json(store_path).query_claims(
+                intervention=intervention,
+                condition=condition,
+                outcome=outcome,
+                effect_direction=parsed_direction,
+                paper_id=paper_id,
+            )
+        elif suffix in _SQLITE_SUFFIXES:
+            matched = GraphSQLiteStore(store_path).query_claims(
+                intervention=intervention,
+                condition=condition,
+                outcome=outcome,
+                effect_direction=parsed_direction,
+                paper_id=paper_id,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported store extension {store_path.suffix!r} for {store_path}; "
+                "expected .json, .db, .sqlite, or .sqlite3"
+            )
     except (ValueError, OSError, sqlite3.Error) as exc:
         sys.stderr.write(f"Failed to query store '{store}': {exc}\n")
         return 2
-
-    matched = graph.query_claims(
-        intervention=intervention,
-        condition=condition,
-        outcome=outcome,
-        effect_direction=parsed_direction,
-        paper_id=paper_id,
-    )
     if as_json:
         payload = [claim.model_dump(mode="json") for claim in matched]
         sys.stdout.write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
