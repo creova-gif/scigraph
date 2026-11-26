@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from graph.claim_graph import ClaimGraph
+from graph.scoring import compute_topic_consensus, score_claim_evidence
 from graph.store import GraphSQLiteStore, load_graph_json
 from ingest.extractor import extract_claims_from_paper
 from ingest.verifier import verify_paper_claims
@@ -28,6 +29,7 @@ from scigraph.exporters import (
 from scigraph.models import EffectDirection, Paper
 from scigraph.security import ApiRole, AuthGate, SlidingWindowRateLimiter, TokenPolicy
 from scigraph.workspace import WorkspaceManager
+from solver.prioritizer import prioritize_experiments
 from solver.symbolic import detect_contradictions, propose_falsifiable_experiments
 
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
@@ -164,6 +166,22 @@ def _build_openapi_spec() -> dict[str, Any]:
                     "summary": "Detect contradictions and propose falsifiable experiments",
                     "responses": {
                         "200": {"description": "Detected contradictions and experiments"}
+                    },
+                }
+            },
+            "/api/v1/consensus": {
+                "get": {
+                    "summary": "Compute topic consensus and claim evidence scores",
+                    "responses": {
+                        "200": {"description": "Topic consensus and claim evidence scores"}
+                    },
+                }
+            },
+            "/api/v1/prioritize": {
+                "get": {
+                    "summary": "Prioritize falsifiable experiments by ROI and cost tier",
+                    "responses": {
+                        "200": {"description": "Prioritized falsifiable experiments"}
                     },
                 }
             },
@@ -359,6 +377,10 @@ class SciGraphApp:
             return self._require_get(method, lambda: self._handle_claims(params))
         if path == "/api/v1/contradictions":
             return self._require_get(method, lambda: self._handle_contradictions())
+        if path == "/api/v1/consensus":
+            return self._require_get(method, lambda: self._handle_consensus())
+        if path == "/api/v1/prioritize":
+            return self._require_get(method, lambda: self._handle_prioritize())
         if path == "/api/v1/report":
             return self._require_get(method, lambda: self._handle_report(params))
         if path == "/api/v1/verify":
@@ -474,6 +496,33 @@ class SciGraphApp:
             {
                 "contradictions": [pair.model_dump(mode="json") for pair in contradictions],
                 "experiments": [exp.model_dump(mode="json") for exp in experiments],
+            },
+        )
+
+    def _handle_consensus(self) -> ServerResponse:
+        with self._lock:
+            consensus = compute_topic_consensus(self.graph)
+            claim_scores = score_claim_evidence(self.graph)
+        return _json_response(
+            HTTPStatus.OK,
+            {
+                "consensus": [item.model_dump(mode="json") for item in consensus],
+                "claim_scores": {
+                    claim_id: score.model_dump(mode="json")
+                    for claim_id, score in claim_scores.items()
+                },
+            },
+        )
+
+    def _handle_prioritize(self) -> ServerResponse:
+        with self._lock:
+            contradictions = detect_contradictions(self.graph)
+            experiments = propose_falsifiable_experiments(contradictions)
+            prioritized = prioritize_experiments(self.graph, contradictions, experiments)
+        return _json_response(
+            HTTPStatus.OK,
+            {
+                "prioritized": [item.model_dump(mode="json") for item in prioritized],
             },
         )
 

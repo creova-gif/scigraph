@@ -1,0 +1,24 @@
+# Example SciGraph configuration file.
+# Copy to `scigraph.toml` in your working directory or pass via `--config`.
+
+[scigraph]
+# Path to the default graph store (.db/.sqlite for SQLite, or .json).
+# default_store = "scigraph.db"
+
+# Root directory for persisted workspaces.
+# workspace_root = "./workspaces"
+
+# Default organization identifier for claims and server requests.
+default_org = "default-org"
+
+# Host interface for `scigraph serve`.
+server_host = "127.0.0.1"
+
+# Port for `scigraph serve` (1..65535).
+server_port = 8765
+
+# Maximum requests per rate-limit window (optional, >= 1).
+# rate_limit = 120
+
+# Rate-limit sliding window duration in seconds (> 0.0).
+rate_window_seconds = 60.0

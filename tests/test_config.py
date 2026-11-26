@@ -87,6 +87,13 @@ def test_load_scigraph_config_invalid_values_raise_value_error(
         load_scigraph_config(cfg_file)
 
 
+def test_load_scigraph_config_example_file() -> None:
+    example_path = Path(__file__).resolve().parents[1] / "scigraph.toml.example"
+    cfg = load_scigraph_config(example_path)
+    assert isinstance(cfg, SciGraphConfig)
+    assert cfg == SciGraphConfig()
+
+
 def test_load_scigraph_config_missing_or_directory_raises_value_error(tmp_path: Path) -> None:
     missing = tmp_path / "missing.toml"
     with pytest.raises(ValueError):

@@ -302,8 +302,17 @@ class WorkspaceManager:
             os.fsync(handle.fileno())
         return event
 
-    def read_audit_log(self, org_id: str, workspace_id: str) -> list[AuditEvent]:
-        """Read all AuditEvent entries from the workspace's audit.jsonl file."""
+    def read_audit_log(
+        self,
+        org_id: str,
+        workspace_id: str,
+        *,
+        action: WorkspaceAction | None = None,
+        limit: int | None = None,
+    ) -> list[AuditEvent]:
+        """Read AuditEvent entries from the workspace's audit.jsonl file."""
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be >= 1")
         self.get_workspace(org_id, workspace_id)
         ws_dir = self._resolve_workspace_dir(org_id, workspace_id)
         audit_path = ws_dir / "audit.jsonl"
@@ -315,4 +324,8 @@ class WorkspaceManager:
             stripped = line.strip()
             if stripped:
                 events.append(AuditEvent.model_validate_json(stripped))
+        if action is not None:
+            events = [event for event in events if event.action == action]
+        if limit is not None:
+            events = events[-limit:]
         return events

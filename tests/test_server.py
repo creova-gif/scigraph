@@ -127,6 +127,8 @@ def test_app_health_and_openapi() -> None:
         "/metrics",
         "/api/v1/claims",
         "/api/v1/contradictions",
+        "/api/v1/consensus",
+        "/api/v1/prioritize",
         "/api/v1/report",
         "/api/v1/verify",
     ):
@@ -468,3 +470,73 @@ def test_http_server_post_body_read_timeout_returns_408() -> None:
             server_sock.close()
     finally:
         server.server_close()
+
+
+def test_app_consensus_and_method_not_allowed() -> None:
+    empty_app = SciGraphApp()
+    empty_status, empty_ctype, empty_body = empty_app.handle_request("GET", "/api/v1/consensus")
+    assert empty_status == 200
+    assert empty_ctype == "application/json"
+    assert json.loads(empty_body) == {"consensus": [], "claim_scores": {}}
+
+    app = SciGraphApp(_build_populated_graph())
+    status, ctype, body = app.handle_request("GET", "/api/v1/consensus")
+    assert status == 200
+    assert ctype == "application/json"
+    payload = json.loads(body)
+
+    assert len(payload["consensus"]) == 1
+    topic = payload["consensus"][0]
+    assert topic["intervention"] == "metformin"
+    assert topic["outcome"] == "ampk phosphorylation"
+    assert topic["contested"] is True
+    assert topic["supporting_claims"] == 1
+    assert topic["contradicting_claims"] == 1
+    assert topic["neutral_claims"] == 0
+    assert topic["consensus_direction"] is None
+    assert topic["consensus_score"] == 0.0
+
+    claim_scores = payload["claim_scores"]
+    assert len(claim_scores) == 2
+    paper_ids = {score["paper_id"] for score in claim_scores.values()}
+    assert paper_ids == {"paper-a", "paper-b"}
+    for claim_id, score in claim_scores.items():
+        assert score["claim_id"] == claim_id
+        assert score["has_effect_size"] is True
+        assert score["contradiction_count"] == 1
+        assert 0.0 <= score["evidence_strength"] <= 1.0
+        assert score["tier"] in {"HIGH", "MODERATE", "PRELIMINARY"}
+
+    post_status, post_ctype, post_body = app.handle_request("POST", "/api/v1/consensus")
+    assert post_status == 405
+    assert post_ctype == "application/json"
+    assert "error" in json.loads(post_body)
+
+
+def test_app_prioritize_and_method_not_allowed() -> None:
+    empty_app = SciGraphApp()
+    empty_status, empty_ctype, empty_body = empty_app.handle_request("GET", "/api/v1/prioritize")
+    assert empty_status == 200
+    assert empty_ctype == "application/json"
+    assert json.loads(empty_body) == {"prioritized": []}
+
+    app = SciGraphApp(_build_populated_graph())
+    status, ctype, body = app.handle_request("GET", "/api/v1/prioritize")
+    assert status == 200
+    assert ctype == "application/json"
+    payload = json.loads(body)
+
+    assert len(payload["prioritized"]) == 1
+    item = payload["prioritized"][0]
+    assert item["rank"] == 1
+    assert item["experiment_id"]
+    assert item["contradiction_id"]
+    assert 0.0 <= item["priority_score"] <= 1.0
+    assert item["cost_tier"] in {"LOW", "MEDIUM", "HIGH"}
+    assert item["estimated_participants"] >= 1
+    assert "avg_evidence=" in item["reason"]
+
+    post_status, post_ctype, post_body = app.handle_request("POST", "/api/v1/prioritize")
+    assert post_status == 405
+    assert post_ctype == "application/json"
+    assert "error" in json.loads(post_body)

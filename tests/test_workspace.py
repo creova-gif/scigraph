@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+from scigraph.cli import main
 from scigraph.models import EdgeRelation, Paper
 from scigraph.workspace import AuditEvent, WorkspaceConfig, WorkspaceManager
 
@@ -292,3 +294,101 @@ def test_unverified_doi_paper_gated_out_of_graph_papers(tmp_path: Path) -> None:
     reloaded = manager.load_graph("org-gate", "ws-gate")
     assert [p.paper_id for p in reloaded.papers] == ["p-verified"]
     assert (tmp_path / "org-gate" / "ws-gate" / ".workspace.lock").is_file()
+
+
+def test_read_audit_log_filtering_and_limit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manager = WorkspaceManager(tmp_path)
+    manager.init_workspace("org-filter", "ws-filter", "Filter Workspace")
+
+    e1 = manager.record_event(
+        org_id="org-filter",
+        workspace_id="ws-filter",
+        action="query",
+        paper_count=0,
+        claim_count=1,
+        status="ok",
+        detail="query-1",
+    )
+    e2 = manager.record_event(
+        org_id="org-filter",
+        workspace_id="ws-filter",
+        action="export",
+        paper_count=1,
+        claim_count=2,
+        status="ok",
+        detail="export-1",
+    )
+    e3 = manager.record_event(
+        org_id="org-filter",
+        workspace_id="ws-filter",
+        action="query",
+        paper_count=0,
+        claim_count=3,
+        status="ok",
+        detail="query-2",
+    )
+    e4 = manager.record_event(
+        org_id="org-filter",
+        workspace_id="ws-filter",
+        action="query",
+        paper_count=0,
+        claim_count=4,
+        status="ok",
+        detail="query-3",
+    )
+
+    all_events = manager.read_audit_log("org-filter", "ws-filter")
+    assert len(all_events) == 5
+    assert all_events[0].action == "verify"
+    assert all_events[1:] == [e1, e2, e3, e4]
+    assert manager.read_audit_log("org-filter", "ws-filter", action="query") == [e1, e3, e4]
+    assert manager.read_audit_log("org-filter", "ws-filter", action="export") == [e2]
+    assert manager.read_audit_log("org-filter", "ws-filter", limit=2) == [e3, e4]
+    assert manager.read_audit_log("org-filter", "ws-filter", action="query", limit=2) == [e3, e4]
+
+    for bad_limit in (0, -1):
+        with pytest.raises(ValueError, match="limit must be >= 1"):
+            manager.read_audit_log("org-filter", "ws-filter", limit=bad_limit)
+
+    rc = main(
+        [
+            "workspace",
+            "audit",
+            "--root",
+            str(tmp_path),
+            "--org",
+            "org-filter",
+            "--workspace",
+            "ws-filter",
+            "--action",
+            "query",
+            "--limit",
+            "2",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert rc == 0
+    payload = json.loads(captured.out)
+    assert [item["detail"] for item in payload] == ["query-2", "query-3"]
+
+    rc_bad = main(
+        [
+            "workspace",
+            "audit",
+            "--root",
+            str(tmp_path),
+            "--org",
+            "org-filter",
+            "--workspace",
+            "ws-filter",
+            "--limit",
+            "0",
+        ]
+    )
+    bad_captured = capsys.readouterr()
+    assert rc_bad == 2
+    assert "limit must be >= 1" in bad_captured.err
