@@ -644,3 +644,45 @@ def test_http_server_413_increments_request_and_error_metrics() -> None:
     metrics = _parse_prometheus_metrics(metrics_body)
     assert metrics["scigraph_requests_total"] == "1"
     assert metrics["scigraph_errors_total"] == "1"
+
+
+def test_app_head_health_and_method_not_allowed() -> None:
+    app = SciGraphApp(_build_populated_graph())
+
+    status, ctype, body = app.handle_request("HEAD", "/health")
+    assert status == 200
+    assert ctype == "application/json"
+    assert body == ""
+
+    claims_status, claims_ctype, claims_body = app.handle_request("HEAD", "/api/v1/claims")
+    assert claims_status == 405
+    assert claims_ctype == "application/json"
+    assert json.loads(claims_body)["error"] == "Method HEAD not allowed"
+
+
+def test_http_server_head_health_and_405() -> None:
+    app = SciGraphApp(_build_populated_graph())
+    with _running_server(app) as base_url:
+        status, headers, body = _http_request(
+            f"{base_url}/health",
+            method="HEAD",
+            headers={"X-Request-Id": "probe-123"},
+        )
+        assert status == 200
+        assert body == ""
+        assert headers["content-type"] == "application/json"
+        assert headers["content-length"] == "0"
+        assert headers["x-content-type-options"] == "nosniff"
+        assert headers["cache-control"] == "no-store"
+        assert headers["x-request-id"] == "probe-123"
+
+        claims_status, claims_headers, claims_body = _http_request(
+            f"{base_url}/api/v1/claims",
+            method="HEAD",
+        )
+        assert claims_status == 405
+        assert claims_body == ""
+        assert claims_headers["content-type"] == "application/json"
+        assert claims_headers["x-content-type-options"] == "nosniff"
+        assert claims_headers["cache-control"] == "no-store"
+        assert "x-request-id" in claims_headers

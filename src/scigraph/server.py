@@ -427,6 +427,12 @@ class SciGraphApp:
         if path == "/":
             return self._require_get(method, lambda: self._handle_explorer())
         if path == "/health":
+            if method == "HEAD":
+                return ServerResponse(
+                    status=HTTPStatus.OK,
+                    content_type="application/json",
+                    body="",
+                )
             return self._require_get(method, lambda: self._handle_health())
         if path == "/metrics":
             return self._require_get(method, lambda: self._handle_metrics())
@@ -738,16 +744,22 @@ def create_http_server(
             # Suppress default stderr request logging for clean CLI/test output.
             return
 
-        def do_GET(self) -> None:
+        def _handle_no_body_method(self, method: str, *, include_body: bool) -> None:
             self._current_request_id = _sanitize_request_id(self.headers.get("X-Request-Id"))
             hdr_value = self.headers.get("Authorization")
             status, content_type, body_text = app.handle_request(
-                "GET",
+                method,
                 self.path,
                 incoming_header=hdr_value,
                 remote_addr=self.client_address[0],
             )
-            self._write_response(status, content_type, body_text)
+            self._write_response(status, content_type, body_text, include_body=include_body)
+
+        def do_GET(self) -> None:
+            self._handle_no_body_method("GET", include_body=True)
+
+        def do_HEAD(self) -> None:
+            self._handle_no_body_method("HEAD", include_body=False)
 
         def _send_transport_error(self, status: HTTPStatus, message: str) -> None:
             app.record_transport_error(status)
@@ -828,7 +840,14 @@ def create_http_server(
             )
             self._write_response(resp.status, resp.content_type, resp.body)
 
-        def _write_response(self, status: int, content_type: str, body_text: str) -> None:
+        def _write_response(
+            self,
+            status: int,
+            content_type: str,
+            body_text: str,
+            *,
+            include_body: bool = True,
+        ) -> None:
             payload = body_text.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -837,7 +856,8 @@ def create_http_server(
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Request-Id", self._current_request_id)
             self.end_headers()
-            self.wfile.write(payload)
+            if include_body:
+                self.wfile.write(payload)
 
     return _SciGraphHTTPServer((host, port), _Handler)
 

@@ -8,16 +8,19 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from graph.claim_graph import ClaimGraph
-from graph.store import GraphSQLiteStore
+from graph.store import GraphSQLiteStore, save_graph_json
 from ingest.extractor import extract_claims_from_paper
 from ingest.verifier import verify_paper_claims
 from scigraph.io_utils import atomic_write_text
 from scigraph.models import Paper, PaperVerificationReport
+
+if TYPE_CHECKING:
+    from scigraph.provenance import ProvenanceManifest
 
 WorkspaceAction = Literal["ingest", "verify", "query", "export", "contradiction_scan"]
 AuditStatus = Literal["ok", "rejected", "error"]
@@ -312,3 +315,63 @@ class WorkspaceManager:
         if limit is not None:
             events = events[-limit:]
         return events
+
+    def export_workspace_bundle(
+        self,
+        org_id: str,
+        workspace_id: str,
+        output_dir: Path,
+        *,
+        hmac_key: bytes | None = None,
+    ) -> ProvenanceManifest:
+        """Export an atomic compliance bundle (graph, provenance, workspace config, audit log)."""
+        # Inline import avoids circular dependency: scigraph.provenance imports AuditEvent here.
+        from scigraph.provenance import build_provenance_manifest
+
+        self.get_workspace(org_id, workspace_id)
+        ws_dir = self._resolve_workspace_dir(org_id, workspace_id)
+
+        with _workspace_lock(ws_dir):
+            config = self.get_workspace(org_id, workspace_id)
+            graph = self.load_graph(org_id, workspace_id)
+            events = self.read_audit_log(org_id, workspace_id)
+
+            manifest = build_provenance_manifest(
+                graph,
+                audit_events=events,
+                hmac_key=hmac_key,
+            )
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            save_graph_json(graph, output_dir / "graph.json")
+            atomic_write_text(
+                output_dir / "provenance.json",
+                manifest.model_dump_json(indent=2) + "\n",
+                prefix=".provenance.json.",
+                create_parents=True,
+            )
+            atomic_write_text(
+                output_dir / "workspace.json",
+                config.model_dump_json(indent=2) + "\n",
+                prefix=".workspace.json.",
+                create_parents=True,
+            )
+            audit_content = "".join(event.model_dump_json() + "\n" for event in events)
+            atomic_write_text(
+                output_dir / "audit.jsonl",
+                audit_content,
+                prefix=".audit.jsonl.",
+                create_parents=True,
+            )
+
+            self.record_event(
+                org_id=org_id,
+                workspace_id=workspace_id,
+                action="export",
+                paper_count=len(graph.papers),
+                claim_count=len(graph.claims),
+                status="ok",
+                detail=f"Exported compliance bundle to {output_dir}",
+            )
+
+        return manifest

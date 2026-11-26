@@ -162,7 +162,7 @@ class SlidingWindowRateLimiter:
         self._windows: dict[str, deque[float]] = {}
 
     def _prune_windows_locked(self, cutoff: float) -> None:
-        """Sweep expired buckets and evict oldest entries if still at capacity."""
+        """Sweep expired timestamps and remove empty buckets."""
         expired_keys: list[str] = []
         for key, win in self._windows.items():
             while win and win[0] <= cutoff:
@@ -173,10 +173,6 @@ class SlidingWindowRateLimiter:
         for key in expired_keys:
             del self._windows[key]
 
-        while len(self._windows) >= self._max_clients:
-            oldest_key = next(iter(self._windows))
-            del self._windows[oldest_key]
-
     def check(self, client_key: str) -> tuple[bool, float]:
         """Record a request if under limit, or return (False, retry_after_seconds)."""
         with self._lock:
@@ -186,6 +182,10 @@ class SlidingWindowRateLimiter:
             if bucket is None:
                 if len(self._windows) >= self._max_clients:
                     self._prune_windows_locked(cutoff)
+                    if len(self._windows) >= self._max_clients:
+                        min_oldest = min(win[0] for win in self._windows.values())
+                        retry_after = max(0.0, (min_oldest + self._window_seconds) - now)
+                        return (False, retry_after)
                 bucket = deque()
                 self._windows[client_key] = bucket
 

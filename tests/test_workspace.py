@@ -6,9 +6,11 @@ from pathlib import Path
 import pytest
 
 import scigraph.workspace as workspace_module
+from graph.store import load_graph_json
 from ingest.extractor import extract_claims_from_paper
 from scigraph.cli import main
 from scigraph.models import EdgeRelation, Paper, ScientificClaim
+from scigraph.provenance import ProvenanceManifest, verify_provenance_manifest
 from scigraph.workspace import AuditEvent, WorkspaceConfig, WorkspaceManager
 
 
@@ -496,3 +498,123 @@ def test_interleaved_ingest_papers_do_not_overwrite_each_other(
     assert sorted(p.paper_id for p in reloaded.papers) == ["p-first", "p-second"]
     assert sorted(c.paper_id for c in reloaded.claims) == ["p-first", "p-second"]
     assert len(reloaded.edges) == 1
+
+
+def test_export_workspace_bundle_unsigned_and_verified(tmp_path: Path) -> None:
+    manager = WorkspaceManager(tmp_path / "workspaces")
+    cfg = manager.init_workspace("org-export", "ws-export", "Export Workspace")
+
+    paper = _make_paper(
+        paper_id="p-exp-1",
+        doi="10.5555/export.001",
+        sentence=(
+            "Treatment with Metformin under normoxia decreased blood glucose "
+            "compared with placebo (mean diff -1.4 mmol/L; n = 120, p < 0.001)."
+        ),
+    )
+    manager.ingest_papers("org-export", "ws-export", [paper])
+
+    bundle_dir = tmp_path / "bundles" / "unsigned"
+    manifest = manager.export_workspace_bundle("org-export", "ws-export", bundle_dir)
+
+    expected_files = {"graph.json", "provenance.json", "workspace.json", "audit.jsonl"}
+    assert expected_files.issubset({p.name for p in bundle_dir.iterdir() if p.is_file()})
+
+    loaded_graph = load_graph_json(bundle_dir / "graph.json")
+    loaded_manifest = ProvenanceManifest.model_validate_json(
+        (bundle_dir / "provenance.json").read_text(encoding="utf-8")
+    )
+    loaded_config = WorkspaceConfig.model_validate_json(
+        (bundle_dir / "workspace.json").read_text(encoding="utf-8")
+    )
+    bundle_events = [
+        AuditEvent.model_validate_json(line)
+        for line in (bundle_dir / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert loaded_manifest == manifest
+    assert loaded_manifest.signature_hmac_sha256 is None
+    assert loaded_config == cfg
+    assert [e.action for e in bundle_events] == ["verify", "ingest"]
+
+    ok, reasons = verify_provenance_manifest(
+        loaded_graph,
+        loaded_manifest,
+        audit_events=bundle_events,
+    )
+    assert ok is True
+    assert reasons == ()
+
+    workspace_events = manager.read_audit_log("org-export", "ws-export")
+    assert [e.action for e in workspace_events] == ["verify", "ingest", "export"]
+    export_event = workspace_events[-1]
+    assert export_event.status == "ok"
+    assert export_event.paper_count == 1
+    assert export_event.claim_count == 1
+
+
+def test_export_workspace_bundle_with_hmac_key(tmp_path: Path) -> None:
+    manager = WorkspaceManager(tmp_path / "workspaces")
+    manager.init_workspace("org-hmac", "ws-hmac", "HMAC Workspace")
+
+    paper = _make_paper(
+        paper_id="p-hmac-1",
+        doi="10.5555/hmac.001",
+        sentence=(
+            "Treatment with Rapamycin under hypoxia increased autophagy flux "
+            "compared with vehicle (1.8-fold; n = 45, p = 0.004)."
+        ),
+    )
+    manager.ingest_papers("org-hmac", "ws-hmac", [paper])
+
+    hmac_key = b"deterministic-test-hmac-key"
+    bundle_dir = tmp_path / "bundles" / "signed"
+    manifest = manager.export_workspace_bundle(
+        "org-hmac",
+        "ws-hmac",
+        bundle_dir,
+        hmac_key=hmac_key,
+    )
+
+    assert manifest.signature_hmac_sha256 is not None
+
+    loaded_graph = load_graph_json(bundle_dir / "graph.json")
+    loaded_manifest = ProvenanceManifest.model_validate_json(
+        (bundle_dir / "provenance.json").read_text(encoding="utf-8")
+    )
+    bundle_events = [
+        AuditEvent.model_validate_json(line)
+        for line in (bundle_dir / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    ok, reasons = verify_provenance_manifest(
+        loaded_graph,
+        loaded_manifest,
+        audit_events=bundle_events,
+        hmac_key=hmac_key,
+    )
+    assert ok is True
+    assert reasons == ()
+
+    wrong_ok, wrong_reasons = verify_provenance_manifest(
+        loaded_graph,
+        loaded_manifest,
+        audit_events=bundle_events,
+        hmac_key=b"wrong-key",
+    )
+    assert wrong_ok is False
+    assert "hmac_signature_mismatch" in wrong_reasons
+
+    missing_key_ok, missing_key_reasons = verify_provenance_manifest(
+        loaded_graph,
+        loaded_manifest,
+        audit_events=bundle_events,
+    )
+    assert missing_key_ok is False
+    assert "hmac_key_required" in missing_key_reasons
+
+    export_events = manager.read_audit_log("org-hmac", "ws-hmac", action="export")
+    assert len(export_events) == 1
+    assert export_events[0].status == "ok"

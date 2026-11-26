@@ -284,7 +284,7 @@ def test_rate_limiter_sweeps_expired_buckets_at_cap() -> None:
     assert list(limiter._windows.keys()) == ["c4"]
 
 
-def test_rate_limiter_evicts_oldest_when_still_at_cap() -> None:
+def test_rate_limiter_preserves_active_windows_and_fails_closed_at_cap() -> None:
     clock = FakeClock(initial=100.0)
     limiter = SlidingWindowRateLimiter(
         max_requests=1,
@@ -300,13 +300,19 @@ def test_rate_limiter_evicts_oldest_when_still_at_cap() -> None:
     assert limiter.check("c3") == (True, 0.0)
     assert len(limiter._windows) == 3
 
-    # No buckets are expired at t=102.0; inserting c4 must evict oldest (c1)
-    assert limiter.check("c4") == (True, 0.0)
+    # At t=102.0 no buckets are expired; c4 must fail closed without evicting c1..c3
+    c4_allowed, c4_retry = limiter.check("c4")
+    assert c4_allowed is False
+    assert c4_retry == pytest.approx(8.0)
     assert len(limiter._windows) == 3
-    assert "c1" not in limiter._windows
-    assert set(limiter._windows.keys()) == {"c2", "c3", "c4"}
+    assert set(limiter._windows.keys()) == {"c1", "c2", "c3"}
 
-    # Existing active clients remain throttled within their window
-    allowed, retry_after = limiter.check("c2")
-    assert allowed is False
-    assert retry_after > 0.0
+    # c1 is still rate-limited within its window (not evicted)
+    c1_allowed, c1_retry = limiter.check("c1")
+    assert c1_allowed is False
+    assert c1_retry == pytest.approx(8.0)
+
+    # Once c1's window expires at t=110.0, expired bucket c1 is swept and c4 is admitted
+    clock.advance(8.0)
+    assert limiter.check("c4") == (True, 0.0)
+    assert set(limiter._windows.keys()) == {"c2", "c3", "c4"}
